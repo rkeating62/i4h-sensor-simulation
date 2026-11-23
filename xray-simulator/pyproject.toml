@@ -13,6 +13,9 @@ dependencies = [
     "scipy",
     "jsonschema>=4.18",
     "PyYAML>=6.0",
+    "itk-rtk",
+    "pyside6",
+    "slangpy",
 ]
 
 [project.scripts]
@@ -33,9 +36,6 @@ validation = [
     "scikit-image>=0.21",
     "pillow>=10.0.0",
 ]
-
-dicom = ["SimpleITK>=2.3.0"]
-nifti = ["nibabel>=5.0.0"]
 
 all = [
     "matplotlib>=3.9.0",
