@@ -3,7 +3,9 @@
 
 This GUI renders fluoroscopy frames from a preprocessed CT volume and exposes
 controls for geometry, pose, and simple display/noise effects.
-Install the qt-cuda12 or qt-cuda13 project extra for CUDA radiograph processing.
+Install the qt-cuda12 or qt-cuda13 project extra for CUDA processing and display.
+Requires an NVIDIA-backed desktop OpenGL 3.3 context on the simulation GPU.
+Sensor and radiograph pixels stay on the GPU; only pose parameters are uploaded.
 
 Supported load targets:
 - a cached preprocessed volume directory containing ``mu_volume.npy`` and ``metadata.json``
@@ -15,6 +17,7 @@ Supported load targets:
 from __future__ import annotations
 
 import os
+import ctypes
 import math
 import sys
 from pathlib import Path
@@ -36,12 +39,12 @@ from xray_simulator.radiograph import process_radiograph
 
 try:
     from PySide6.QtCore import QTimer, Qt
-    from PySide6.QtGui import QDoubleValidator, QImage, QIntValidator, QPixmap
+    from PySide6.QtGui import QDoubleValidator, QIntValidator, QSurfaceFormat
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
         QFileDialog,
-        QGridLayout,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -49,7 +52,6 @@ try:
         QMainWindow,
         QMessageBox,
         QPushButton,
-        QScrollArea,
         QSlider,
         QVBoxLayout,
         QWidget,
@@ -58,12 +60,12 @@ try:
 except ImportError:
     try:
         from PyQt6.QtCore import QTimer, Qt
-        from PyQt6.QtGui import QDoubleValidator, QImage, QIntValidator, QPixmap
+        from PyQt6.QtGui import QDoubleValidator, QIntValidator, QSurfaceFormat
+        from PyQt6.QtOpenGLWidgets import QOpenGLWidget
         from PyQt6.QtWidgets import (
             QApplication,
             QCheckBox,
             QFileDialog,
-            QGridLayout,
             QGroupBox,
             QHBoxLayout,
             QLabel,
@@ -71,7 +73,6 @@ except ImportError:
             QMainWindow,
             QMessageBox,
             QPushButton,
-            QScrollArea,
             QSlider,
             QVBoxLayout,
             QWidget,
@@ -80,12 +81,12 @@ except ImportError:
     except ImportError:
         try:
             from PyQt5.QtCore import QTimer, Qt
-            from PyQt5.QtGui import QDoubleValidator, QImage, QIntValidator, QPixmap
+            from PyQt5.QtGui import QDoubleValidator, QIntValidator, QSurfaceFormat
             from PyQt5.QtWidgets import (
+                QOpenGLWidget,
                 QApplication,
                 QCheckBox,
                 QFileDialog,
-                QGridLayout,
                 QGroupBox,
                 QHBoxLayout,
                 QLabel,
@@ -93,7 +94,6 @@ except ImportError:
                 QMainWindow,
                 QMessageBox,
                 QPushButton,
-                QScrollArea,
                 QSlider,
                 QVBoxLayout,
                 QWidget,
@@ -140,20 +140,10 @@ DEFAULT_PREPROCESSING_SETTINGS = PreprocessingSettings(
 
 try:
     ORIENTATION_HORIZONTAL = Qt.Orientation.Horizontal
-    ALIGN_CENTER = Qt.AlignmentFlag.AlignCenter
     ALIGN_RIGHT_VCENTER = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-    KEEP_ASPECT = Qt.AspectRatioMode.KeepAspectRatio
-    SMOOTH_TRANSFORM = Qt.TransformationMode.SmoothTransformation
-    IMAGE_FORMAT_RGB888 = QImage.Format.Format_RGB888
-    IMAGE_FORMAT_GRAY8 = QImage.Format.Format_Grayscale8
 except AttributeError:
     ORIENTATION_HORIZONTAL = Qt.Horizontal
-    ALIGN_CENTER = Qt.AlignCenter
     ALIGN_RIGHT_VCENTER = Qt.AlignRight | Qt.AlignVCenter
-    KEEP_ASPECT = Qt.KeepAspectRatio
-    SMOOTH_TRANSFORM = Qt.SmoothTransformation
-    IMAGE_FORMAT_RGB888 = QImage.Format_RGB888
-    IMAGE_FORMAT_GRAY8 = QImage.Format_Grayscale8
 
 
 def create_synthetic_volume() -> PreprocessedVolume:
@@ -199,13 +189,169 @@ def load_ct_volume_from_path(path: Path) -> PreprocessedVolume:
         return load_cached_volume()
 
 
-def qimage_from_array(image: np.ndarray) -> QImage:
-    """Convert a uint8 RGB image to QImage."""
-    rgb = np.ascontiguousarray(image)
-    height, width, _channels = rgb.shape
-    bytes_per_line = width * 3
-    qimage = QImage(rgb.data, width, height, bytes_per_line, IMAGE_FORMAT_RGB888)
-    return qimage.copy()
+def _cuda_result(result):
+    """Unpack cuda-python's status-first return values."""
+    status, *values = result
+    if int(status):
+        raise RuntimeError(f"CUDA–OpenGL interop failed: {status}")
+    return values
+
+
+class CudaImageView(QOpenGLWidget):
+    """Display a CuPy uint16 image through a CUDA-registered pixel buffer.
+
+    Map/copy/unmap runs on the producing CuPy stream. CUDA's interop barriers
+    order the GL texture upload after the device copy without host readback.
+    Resources belong to this widget's GL context and are recreated on resize
+    of the detector or on Qt context replacement.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(320, 320)
+        self._resource = None
+        self._pbo = self._texture = self._program = self._vao = 0
+        self._shape = None
+        self._image = None
+        self._error = None
+
+    def initializeGL(self):  # noqa: N802
+        try:
+            import cupy as cp
+            from cuda.bindings import runtime
+            from OpenGL import GL
+            from OpenGL.GL.shaders import compileProgram, compileShader
+
+            self.cp, self.cuda, self.gl = cp, runtime, GL
+            self.context().aboutToBeDestroyed.connect(self.cleanup)
+            self._program = compileProgram(
+                compileShader("""#version 330 core
+                    out vec2 uv;
+                    void main() {
+                        vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+                        uv = vec2(p.x, 1.0 - p.y);
+                        gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+                    }""", GL.GL_VERTEX_SHADER),
+                compileShader("""#version 330 core
+                    in vec2 uv;
+                    uniform sampler2D image;
+                    out vec4 color;
+                    void main() {
+                        float gray = texture(image, uv).r;
+                        color = vec4(gray, gray, gray, 1.0);
+                    }""", GL.GL_FRAGMENT_SHADER),
+            )
+            self._vao = GL.glGenVertexArrays(1)
+            self._error = None
+        except Exception as exc:
+            self._error = exc
+
+    def _release_image(self):
+        if self._resource is not None:
+            _cuda_result(self.cuda.cudaGraphicsUnregisterResource(self._resource))
+            self._resource = None
+        if self._pbo:
+            self.gl.glDeleteBuffers(1, [self._pbo])
+            self._pbo = 0
+        if self._texture:
+            self.gl.glDeleteTextures([self._texture])
+            self._texture = 0
+        self._shape = None
+
+    def set_image(self, image):
+        """Upload device pixels while this widget's OpenGL context is current."""
+        if not self.isValid():
+            raise RuntimeError("A working NVIDIA OpenGL context is required")
+        self.makeCurrent()
+        try:
+            if self._error is not None:
+                raise RuntimeError(f"Cannot initialize CUDA–OpenGL display: {self._error}")
+            cp, GL = self.cp, self.gl
+            if not isinstance(image, cp.ndarray) or image.ndim != 2 or image.dtype != cp.uint16:
+                raise ValueError("Display expects a 2D CuPy uint16 image")
+            with image.device:
+                image = cp.ascontiguousarray(image)
+                height, width = image.shape
+                if self._shape != image.shape:
+                    self._release_image()
+                    self._pbo = GL.glGenBuffers(1)
+                    GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self._pbo)
+                    GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, image.nbytes, None, GL.GL_STREAM_DRAW)
+                    self._resource, = _cuda_result(self.cuda.cudaGraphicsGLRegisterBuffer(
+                        int(self._pbo), self.cuda.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard,
+                    ))
+                    self._texture = GL.glGenTextures(1)
+                    GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
+                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
+                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
+                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
+                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
+                    GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+                    GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_R16, width, height,
+                                    0, GL.GL_RED, GL.GL_UNSIGNED_SHORT, None)
+                    self._shape = image.shape
+                stream = cp.cuda.get_current_stream()
+                # cuda-python accepts the handle wrapper for a single resource,
+                # not a Python list. The wrapper supplies the handle's address.
+                _cuda_result(self.cuda.cudaGraphicsMapResources(1, self._resource, stream.ptr))
+                try:
+                    ptr, size = _cuda_result(self.cuda.cudaGraphicsResourceGetMappedPointer(self._resource))
+                    if size < image.nbytes:
+                        raise RuntimeError("Mapped OpenGL buffer is smaller than the image")
+                    cp.cuda.runtime.memcpyAsync(int(ptr), image.data.ptr, image.nbytes,
+                                                cp.cuda.runtime.memcpyDeviceToDevice, stream.ptr)
+                finally:
+                    _cuda_result(self.cuda.cudaGraphicsUnmapResources(1, self._resource, stream.ptr))
+                # Retain the source until the asynchronous device copy completes.
+                stream.synchronize()
+                GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self._pbo)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
+                GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
+                GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, height,
+                                   GL.GL_RED, GL.GL_UNSIGNED_SHORT, ctypes.c_void_p(0))
+                self._image = image
+        finally:
+            if hasattr(self, "gl"):
+                self.gl.glBindBuffer(self.gl.GL_PIXEL_UNPACK_BUFFER, 0)
+            self.doneCurrent()
+        self.update()
+
+    def paintGL(self):  # noqa: N802
+        if self._error is not None:
+            return
+        GL = self.gl
+        GL.glClearColor(0.06, 0.06, 0.06, 1.0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        if self._shape is None:
+            return
+        rows, cols = self._shape
+        ratio = self.devicePixelRatioF()
+        width, height = round(self.width() * ratio), round(self.height() * ratio)
+        scale = min(width / cols, height / rows)
+        vw, vh = round(cols * scale), round(rows * scale)
+        GL.glViewport((width - vw) // 2, (height - vh) // 2, vw, vh)
+        GL.glUseProgram(self._program)
+        GL.glActiveTexture(GL.GL_TEXTURE0)
+        GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
+        GL.glUniform1i(GL.glGetUniformLocation(self._program, "image"), 0)
+        GL.glBindVertexArray(self._vao)
+        GL.glDrawArrays(GL.GL_TRIANGLES, 0, 3)
+        GL.glBindVertexArray(0)
+        GL.glUseProgram(0)
+
+    def cleanup(self):
+        self.makeCurrent()
+        try:
+            self._release_image()
+            if self._vao:
+                self.gl.glDeleteVertexArrays(1, [self._vao])
+                self._vao = 0
+            if self._program:
+                self.gl.glDeleteProgram(self._program)
+                self._program = 0
+            self._image = None
+        finally:
+            self.doneCurrent()
 
 
 class SliderRow(QWidget):
@@ -361,8 +507,7 @@ class XraySimulatorWindow(QMainWindow):
         self.volume: PreprocessedVolume = load_cached_volume()
         self.realism_enabled = False
         self.simulator: xray_simulator | None = None
-        self._display_image: np.ndarray | None = None
-        self._raw_display_image: np.ndarray | None = None
+        self.current_rotation = self.current_translation = None
         self._needs_simulator_reset = True
 
         self.render_timer = QTimer(self)
@@ -381,21 +526,15 @@ class XraySimulatorWindow(QMainWindow):
         image_views = QWidget()
         image_layout = QHBoxLayout(image_views)
         image_layout.setContentsMargins(0, 0, 0, 0)
-        self.raw_image_label = QLabel("Rendering...")
-        self.image_label = QLabel("Rendering...")
-        for title, label in (
-            ("Simulator output (linear intensity)", self.raw_image_label),
-            ("Processed radiograph", self.image_label),
+        self.raw_image_view = CudaImageView()
+        self.image_view = CudaImageView()
+        for title, view in (
+            ("Simulator output (linear intensity)", self.raw_image_view),
+            ("Processed radiograph", self.image_view),
         ):
             panel = QGroupBox(title)
             panel_layout = QVBoxLayout(panel)
-            label.setAlignment(ALIGN_CENTER)
-            label.setMinimumSize(320, 320)
-            label.setStyleSheet("background:#111; color:#ddd; border:1px solid #333;")
-            scroll = QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setWidget(label)
-            panel_layout.addWidget(scroll)
+            panel_layout.addWidget(view)
             image_layout.addWidget(panel, 1)
         root.addWidget(image_views, 4)
 
@@ -563,69 +702,72 @@ class XraySimulatorWindow(QMainWindow):
             if do_render:
                 self.current_rotation = self.rotation_controls()
                 self.current_translation = self.translation_controls()
-                frame = self.simulator.render_frame(
-                    rotation=self.current_rotation,
-                    translation=self.current_translation,
+                import cupy as cp
+
+                # Batch size one uses the renderer's CUDA buffer export, avoiding
+                # render_frame's NumPy readback and CPU display/realism stages.
+                batch = self.simulator.renderer.render_batch(
+                    np.asarray([self.current_rotation], dtype=np.float32),
+                    np.asarray([self.current_translation], dtype=np.float32),
+                    as_torch=True,
                 )
-                assert frame.intensity is not None
+                if not batch.is_cuda:
+                    raise RuntimeError("The viewer requires the CUDA rendering backend")
+                sensor = cp.from_dlpack(batch[0])
+                sensor = self._apply_gpu_realism(sensor)
                 radiograph = process_radiograph(
-                    frame.intensity,
-                    i0=frame.i0,
+                    sensor,
+                    i0=self.simulator.config.physics.i0,
                     backend="cuda",
                     equalization="adaptive",
                     median_radius=0,
                     adaptive_radius=16,
                     percentiles=(0.1, 99.9),
                 )
-                display = self._format_for_display(radiograph.display)
-                raw_display = self._format_raw_for_display(frame.intensity)
-                self._display_image = display
-                self._raw_display_image = raw_display
-                self._update_image_label(raw_display, self.raw_image_label)
-                self._update_image_label(display)
+                self.raw_image_view.set_image(self._format_raw_for_display(sensor))
+                self.image_view.set_image(radiograph.display)
                 self._set_status(
-                    f"Rendered {display.shape[1]}x{display.shape[0]} frame from "
+                    f"Rendered {sensor.shape[1]}x{sensor.shape[0]} frame from "
                     f"{self.volume.metadata.source or 'synthetic volume'}."
                 )
         except Exception as exc:
+            self.render_timer.stop()
             self._set_status(f"Render failed: {exc}")
             QMessageBox.critical(self, "Render Error", str(exc))
 
-    def _format_for_display(self, image: np.ndarray) -> np.ndarray:
-        """Convert the processed uint16 radiograph to Qt's 8-bit RGB format."""
-        #low = np.min(image)
-        #range = np.max(image) - low
-        #gray = np.rint((image - low).astype(np.float32) / range * 255.0).astype(np.uint8)
-        gray = np.rint(image.astype(np.float32) / 257.0).astype(np.uint8)
-        return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
+    def _apply_gpu_realism(self, image):
+        """Apply the viewer's detector noise and blur controls on the GPU."""
+        import cupy as cp
+        from cupyx.scipy.ndimage import gaussian_filter
 
-    def _format_raw_for_display(self, image: np.ndarray) -> np.ndarray:
-        """Stretch linear intensities across the grayscale display range."""
-        img = image.astype(np.float32, copy=False)
-        low = float(np.min(img))
-        high = float(np.max(img))
-        img = 1.0 - ((img - low) / (high - low)) if high > low else np.ones_like(img)
-        gray = np.rint(np.clip(img * 255.0, 0.0, 255.0)).astype(np.uint8)
-        return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
+        cfg = self.simulator.config.realism
+        if not cfg.enabled:
+            return image
+        out = cp.maximum(image * cfg.gain + cfg.bias, 0)
+        rng = cp.random.RandomState(cfg.seed)
+        if cfg.poisson_photons > 0:
+            out = rng.poisson(out * cfg.poisson_photons).astype(cp.float32) / cfg.poisson_photons
+        if cfg.gaussian_sigma > 0:
+            out = cp.maximum(out + rng.normal(0, cfg.gaussian_sigma, out.shape).astype(cp.float32), 0)
+        if cfg.blur_sigma_px > 0:
+            out = gaussian_filter(out, cfg.blur_sigma_px)
+        return out
 
-    def _update_image_label(self, rgb: np.ndarray, label: QLabel | None = None) -> None:
-        if label is None:
-            label = self.image_label
-        qimage = qimage_from_array(rgb)
-        pixmap = QPixmap.fromImage(qimage)
-        scaled = pixmap.scaled(
-            label.size(),
-            KEEP_ASPECT,
-            SMOOTH_TRANSFORM,
-        )
-        label.setPixmap(scaled)
+    def _format_raw_for_display(self, image):
+        """Stretch linear intensities to uint16 using device operations only."""
+        import cupy as cp
 
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        super().resizeEvent(event)
-        if getattr(self, "_raw_display_image", None) is not None:
-            self._update_image_label(self._raw_display_image, self.raw_image_label)
-        if getattr(self, "_display_image", None) is not None:
-            self._update_image_label(self._display_image)
+        low, high = image.min(), image.max()
+        span = high - low
+        normalized = cp.where(span > 0, (image - low) / cp.maximum(span, 1e-20), 0)
+        return cp.rint(cp.clip(1 - normalized, 0, 1) * 65535).astype(cp.uint16)
+
+    def closeEvent(self, event):  # noqa: N802
+        self.render_timer.stop()
+        for view in (self.raw_image_view, self.image_view):
+            if view.isValid():
+                view.cleanup()
+        super().closeEvent(event)
 
     def reset_controls(self) -> None:
         self.geometry_sliders["sdd"].set_value(DEFAULT_GEOMETRY.source_to_detector_mm)
@@ -670,7 +812,48 @@ class XraySimulatorWindow(QMainWindow):
             QMessageBox.critical(self, "Load Error", str(exc))
 
 
+def check_gpu_dependencies() -> None:
+    """Fail before loading a volume when the active venv cannot run the viewer."""
+    from importlib.util import find_spec
+
+    try:
+        import torch
+        import cupy
+        # Importing cuCIM before the first Slang CUDA device can crash in
+        # rhiCudaDriverApiInit (observed with slangpy 0.43.1 / cuCIM 26.10).
+        # Probe only the top-level package: find_spec on a dotted name would
+        # import its parents. process_radiograph imports cuCIM after rendering.
+        if find_spec("cucim") is None:
+            raise ImportError("cuCIM is not installed")
+        from cuda.bindings import runtime
+        from OpenGL import GL
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            f"GPU viewer dependencies could not be imported by {sys.executable}: {exc}\n"
+            "Install the CUDA extra into this same environment:\n"
+            f'  "{sys.executable}" -m pip install -e "{_PROJECT_DIR}[qt-cuda12]"\n'
+            "Use qt-cuda13 instead for a CUDA 13 environment.\n"
+            "The batch renderer needs CUDA-enabled PyTorch even though image processing uses CuPy."
+        ) from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"PyTorch {torch.__version__} in {sys.executable} cannot access CUDA. "
+            "Install a CUDA-enabled PyTorch build compatible with your NVIDIA driver."
+        )
+
+
 def main() -> int:
+    try:
+        check_gpu_dependencies()
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from exc
+    surface_format = QSurfaceFormat()
+    surface_format.setVersion(3, 3)
+    try:
+        surface_format.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
+    except AttributeError:
+        surface_format.setProfile(QSurfaceFormat.CoreProfile)
+    QSurfaceFormat.setDefaultFormat(surface_format)
     app = QApplication(sys.argv)
     window = XraySimulatorWindow()
     window.show()

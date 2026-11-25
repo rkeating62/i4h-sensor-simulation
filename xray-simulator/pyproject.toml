@@ -21,8 +21,8 @@ dependencies = [
 xray-simulator = "xray_simulator.cli:main"
 
 [project.optional-dependencies]
-qt-cuda12 = ["cupy-cuda12x", "cucim-cu12"]
-qt-cuda13 = ["cupy-cuda13x", "cucim-cu13"]
+qt-cuda12 = ["cupy-cuda12x", "cucim-cu12", "torch>=2.6", "PyOpenGL>=3.1.7", "cuda-python>=12.9,<13"]
+qt-cuda13 = ["cupy-cuda13x", "cucim-cu13", "torch>=2.6", "PyOpenGL>=3.1.7", "cuda-python>=13,<14"]
 rtk = ["itk-rtk"]
 cli = [
     "pillow>=10.0.0",

@@ -156,7 +156,10 @@ pip install -e .[all]
 | `SimpleITK` | DICOM loading (optional, `all` extra) |
 | `torch` | PyTorch integration for autograd (optional) |
 
-The interactive Qt viewer uses CuPy and cuCIM for radiograph processing.
+The interactive Qt viewer renders one-pose batches, processes the sensor image
+with CuPy and cuCIM, and displays both images through CUDA–OpenGL interop.
+Image pixels stay on the GPU. The viewer requires an NVIDIA-backed desktop
+OpenGL 3.3 context on the same GPU as the CUDA renderer.
 
 ```bash
 python -m pip install -e '.[qt-cuda12]'
@@ -166,6 +169,10 @@ python examples/xray_interactive_view_qt.py
 Use `qt-cuda13` for CUDA 13. Install the `datasets` extra to load NIfTI files.
 The `rtk` extra provides ITK filters for CPU radiograph processing and ITK
 projection export.
+`process_radiograph(..., backend="cuda")` returns CuPy arrays; use `.get()`
+explicitly when a host array is needed. The CPU backend returns NumPy arrays.
+On an NVIDIA desktop, run `XRAY_TEST_CUDA_GL=1 python -m pytest tests/test_radiograph.py`
+to include the Qt interop test.
 
 ### Running the tests
 

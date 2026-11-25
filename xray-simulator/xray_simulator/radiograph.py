@@ -5,17 +5,18 @@ exposure's acquisition settings. This expects linear counts, not logged data.
 """
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 
 
 @dataclass
 class Radiograph:
-    attenuation: np.ndarray  # float32, -log(transmission), no display processing
-    display: np.ndarray  # uint16, enhanced for viewing
-    repaired_pixels: np.ndarray  # bool, interpolated detector locations
-    clipped_pixels: np.ndarray  # bool, transmission at/below the log floor
+    # NumPy for CPU processing, CuPy for CUDA processing.
+    attenuation: Any  # float32, -log(transmission), no display processing
+    display: Any  # uint16, enhanced for viewing
+    repaired_pixels: Any  # bool, interpolated detector locations
+    clipped_pixels: Any  # bool, transmission at/below the log floor
 
     def rtk_projection(self):
         """Return an ITK float image (x, y, one projection) for RTK pipelines.
@@ -25,7 +26,10 @@ class Radiograph:
         """
         import itk
 
-        return itk.image_from_array(self.attenuation[np.newaxis, ...])
+        attenuation = self.attenuation
+        if hasattr(attenuation, "__cuda_array_interface__"):
+            attenuation = attenuation.get()  # Explicit host transfer for ITK export only.
+        return itk.image_from_array(attenuation[np.newaxis, ...])
 
 
 def _frame(value, shape, name, xp):
@@ -38,7 +42,7 @@ def _frame(value, shape, name, xp):
 
 
 def process_radiograph(
-    raw: np.ndarray,
+    raw: Any,
     *,
     dark=0.0,
     flat=None,
@@ -77,7 +81,9 @@ def process_radiograph(
     sharpening, and pass-through. The CUDA backend uses CuPy and cuCIM, with
     contrast-limited adaptive histogram equalization (CLAHE) on tiles of up to
     `2 * adaptive_radius + 1` pixels per side. Alpha and beta apply only to ITK.
-    Both backends return NumPy arrays.
+    The CPU backend returns NumPy arrays. The CUDA backend accepts CuPy arrays
+    or CUDA tensors supporting DLPack and returns CuPy arrays; detector and
+    radiograph images stay on the GPU. Validation may synchronize scalar flags.
     Higher attenuation is brighter unless ``invert=True``.
     """
     if backend == "cuda":
@@ -86,15 +92,15 @@ def process_radiograph(
             from cupyx.scipy import ndimage
         except ImportError as exc:
             raise RuntimeError("Install the qt-cuda12 or qt-cuda13 extra for CUDA radiographs") from exc
-        to_numpy = xp.asnumpy
     elif backend == "cpu":
         from scipy import ndimage
 
         xp = np
-        to_numpy = np.asarray
     else:
         raise ValueError(f"Unknown radiograph backend: {backend}")
 
+    if backend == "cuda" and not isinstance(raw, np.ndarray) and hasattr(raw, "__dlpack__"):
+        raw = xp.from_dlpack(raw)
     raw = xp.asarray(raw, dtype=xp.float64)
     if raw.ndim != 2 or raw.size == 0:
         raise ValueError("raw must be a nonempty 2D array")
@@ -203,8 +209,8 @@ def process_radiograph(
     if roi is not None:
         normalized[~roi] = 0
     return Radiograph(
-        attenuation=to_numpy(attenuation),
-        display=to_numpy(xp.rint(normalized * 65535).astype(xp.uint16)),
-        repaired_pixels=to_numpy(invalid),
-        clipped_pixels=to_numpy(clipped),
+        attenuation=attenuation,
+        display=xp.rint(normalized * 65535).astype(xp.uint16),
+        repaired_pixels=invalid,
+        clipped_pixels=clipped,
     )
