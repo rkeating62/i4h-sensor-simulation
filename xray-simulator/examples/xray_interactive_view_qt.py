@@ -663,14 +663,21 @@ class XraySimulatorWindow(QMainWindow):
         self.render_timer = QTimer(self)
         self.render_timer.timeout.connect(self.render_current_view)
 
+        self._initializing = True
+        self._presented_views = set()
+        self._initial_frame_status = None
         self._build_ui()
+        for control in self._startup_controls:
+            control.setEnabled(False)
+        for view in (self.raw_image_view, self.image_view):
+            view.frameSwapped.connect(lambda view=view: self._initial_frame_presented(view))
         self._drag_sliders = [row.slider for group in (
             self.geometry_sliders, self.pose_sliders, self.realism_sliders
         ) for row in group.values()]
         for slider in self._drag_sliders:
             slider.sliderPressed.connect(self.render_current_view)
             slider.sliderReleased.connect(self.render_current_view)
-        self._set_status("Loaded synthetic demo volume.")
+        self._set_status("Simulation is initializing…")
         self.render_timer.start(33)  # Start rendering at 30 fps immediately after UI is shown
 
     def _build_ui(self) -> None:
@@ -771,6 +778,21 @@ class XraySimulatorWindow(QMainWindow):
         actions.addWidget(self.reset_button)
         sidebar_layout.addLayout(actions)
         sidebar_layout.addStretch(1)
+        self._startup_controls = (
+            self.load_button, geometry_group, pose_group, realism_group, self.reset_button,
+        )
+
+    def _initial_frame_presented(self, view) -> None:
+        """Unlock controls after both image widgets have presented real pixels."""
+        if not self._initializing or self._initial_frame_status is None or view._image is None:
+            return
+        self._presented_views.add(view)
+        if len(self._presented_views) != 2:
+            return
+        self._initializing = False
+        for control in self._startup_controls:
+            control.setEnabled(True)
+        self._set_status(self._initial_frame_status)
 
     def _set_status(self, message: str) -> None:
         self.status_label.setText(message)
@@ -855,11 +877,15 @@ class XraySimulatorWindow(QMainWindow):
                       / (geometry.detector_height_px * dy))
             self.raw_image_view.set_image(raw, display_aspect=aspect)
             self.image_view.set_image(display, display_aspect=aspect)
-            self._set_status(
+            status = (
                 f"{'Preview' if state.preview else 'Rendered'} "
                 f"{display.shape[1]}x{display.shape[0]} frame from "
                 f"{state.volume.metadata.source or 'synthetic volume'}."
             )
+            if self._initializing:
+                self._initial_frame_status = status
+            else:
+                self._set_status(status)
         except Exception as exc:
             self.render_timer.stop()
             self._set_status(f"Display failed: {exc}")
