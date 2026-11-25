@@ -156,6 +156,17 @@ pip install -e .[all]
 | `SimpleITK` | DICOM loading (optional, `all` extra) |
 | `torch` | PyTorch integration for autograd (optional) |
 
+The interactive Qt viewer uses CuPy and cuCIM for radiograph processing.
+
+```bash
+python -m pip install -e '.[qt-cuda12]'
+python examples/xray_interactive_view_qt.py
+```
+
+Use `qt-cuda13` for CUDA 13. Install the `datasets` extra to load NIfTI files.
+The `rtk` extra provides ITK filters for CPU radiograph processing and ITK
+projection export.
+
 ### Running the tests
 
 The unit tests run on a host without a GPU, as CI does

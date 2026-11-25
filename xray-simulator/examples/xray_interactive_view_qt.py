@@ -3,6 +3,7 @@
 
 This GUI renders fluoroscopy frames from a preprocessed CT volume and exposes
 controls for geometry, pose, and simple display/noise effects.
+Install the qt-cuda12 or qt-cuda13 project extra for CUDA radiograph processing.
 
 Supported load targets:
 - a cached preprocessed volume directory containing ``mu_volume.npy`` and ``metadata.json``
@@ -18,24 +19,20 @@ import math
 import sys
 from pathlib import Path
 
-from matplotlib import image
 import numpy as np
-
-from xray_simulator.config import PreprocessingSettings, XrayPhysics
-from xray_simulator.radiograph import process_radiograph
 
 from xray_simulator import (
     CarmGeometry,
-    XrayPhysics,
-    Pose,
+    HuToMuMapping,
+    PreprocessingSettings,
     PreprocessedVolume,
     RealismSettings,
     SimulatorConfig,
-    VolumeMetadata,
+    XrayPhysics,
     VolumePreprocessor,
-    HuToMuMapping,
     xray_simulator,
 )
+from xray_simulator.radiograph import process_radiograph
 
 try:
     from PySide6.QtCore import QTimer, Qt
@@ -108,13 +105,9 @@ except ImportError:
                 "xray_interactive_view_qt.py."
             ) from exc
 
-# Get local script directory path
-_SCRIPT_DIR = Path("~/workspace/i4h-sensor-simulation/fluoro-simulator/examples").expanduser().resolve().parent.parent
-# Output directory
-OUTPUT_DIR = Path(os.environ.get("FLUOROSIM_OUTPUT_DIR", str(_SCRIPT_DIR / "output"))).expanduser()# Cache directory for preprocessed volume
+_PROJECT_DIR = Path(__file__).resolve().parent.parent
+OUTPUT_DIR = Path(os.environ.get("FLUOROSIM_OUTPUT_DIR", str(_PROJECT_DIR / "output"))).expanduser()
 CACHE_DIR = Path(os.environ.get("FLUOROSIM_CACHE_DIR", str(OUTPUT_DIR / "cache"))).expanduser()
-# Create the cache directory if it doesn't exist
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_GEOMETRY = CarmGeometry(
     detector_width_px=3072,
@@ -540,8 +533,7 @@ class XraySimulatorWindow(QMainWindow):
             geometry=self.geometry_controls(),
             physics=DEFAULT_PHYSICS,
             realism=self.realism_controls(),
-        )
-        print(config.realism)
+        ).with_output(keep_intensity=True)
         self.simulator = xray_simulator(self.volume, config)
         self._needs_simulator_reset = False
         return True
@@ -575,22 +567,18 @@ class XraySimulatorWindow(QMainWindow):
                     rotation=self.current_rotation,
                     translation=self.current_translation,
                 )
-                print(np.min(frame.image), np.max(frame.image))
-                print(frame.image[0,0])
+                assert frame.intensity is not None
                 radiograph = process_radiograph(
-                    frame.image,
-                    i0=np.min(frame.image),   # Use max frame intensity since i0 value is not valid
-                    dark=0,
-                    equalization="adaptive",  # "global" for ordinary histogram equalization, "adaptive" for dynamic
-                    median_radius=0,          # 3x3 median, display only; 0 disables
-                    adaptive_radius=16,       # local neighborhood radius in detector pixels
-                    alpha=0.7,
-                    beta=0.5,
+                    frame.intensity,
+                    i0=frame.i0,
+                    backend="cuda",
+                    equalization="adaptive",
+                    median_radius=0,
+                    adaptive_radius=16,
                     percentiles=(0.1, 99.9),
-                    invert=False
                 )
                 display = self._format_for_display(radiograph.display)
-                raw_display = self._format_raw_for_display(frame.image)
+                raw_display = self._format_raw_for_display(frame.intensity)
                 self._display_image = display
                 self._raw_display_image = raw_display
                 self._update_image_label(raw_display, self.raw_image_label)
@@ -612,11 +600,11 @@ class XraySimulatorWindow(QMainWindow):
         return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
 
     def _format_raw_for_display(self, image: np.ndarray) -> np.ndarray:
-        """Map linear intensities from zero to the open-beam intensity to gray."""
+        """Stretch linear intensities across the grayscale display range."""
         img = image.astype(np.float32, copy=False)
         low = float(np.min(img))
         high = float(np.max(img))
-        img = 1.0 - ((img - low) / (high - low))
+        img = 1.0 - ((img - low) / (high - low)) if high > low else np.ones_like(img)
         gray = np.rint(np.clip(img * 255.0, 0.0, 255.0)).astype(np.uint8)
         return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
 

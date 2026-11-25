@@ -1,6 +1,5 @@
 """Calibrate a linear detector exposure and create an enhanced display image.
 
-Install: python -m pip install itk-rtk scipy
 Arrays have shape (rows, columns); calibration exposures must match the raw
 exposure's acquisition settings. This expects linear counts, not logged data.
 """
@@ -8,9 +7,7 @@ exposure's acquisition settings. This expects linear counts, not logged data.
 from dataclasses import dataclass
 from typing import Literal
 
-import itk
 import numpy as np
-from scipy import ndimage
 
 
 @dataclass
@@ -26,13 +23,15 @@ class Radiograph:
         Pixel spacing, detector origin, and acquisition geometry must be supplied
         separately using the detector's physical calibration.
         """
+        import itk
+
         return itk.image_from_array(self.attenuation[np.newaxis, ...])
 
 
-def _frame(value, shape, name):
-    result = np.asarray(value, dtype=np.float64)
+def _frame(value, shape, name, xp):
+    result = xp.asarray(value, dtype=xp.float64)
     if result.ndim == 0:
-        return np.full(shape, result, dtype=np.float64)
+        return result
     if result.shape != shape:
         raise ValueError(f"{name} must be scalar or have shape {shape}")
     return result.copy()
@@ -56,6 +55,7 @@ def process_radiograph(
     alpha: float = 0.3,
     beta: float = 0.3,
     invert: bool = False,
+    backend: Literal["cpu", "cuda"] = "cpu",
 ) -> Radiograph:
     """Convert raw counts into calibrated attenuation and a display radiograph.
 
@@ -72,11 +72,30 @@ def process_radiograph(
     Median filtering, percentile windowing, and equalization affect display
     only. ``display_mask`` selects the exposed/anatomical region for window
     estimation and global equalization; excluded pixels display as zero.
-    ITK adaptive equalization is NOT contrast-limited CLAHE. Its alpha/beta
-    parameters blend local equalization, sharpening, and pass-through.
+    The CPU backend uses ITK for median filtering and adaptive equalization
+    (install the `rtk` extra). Its alpha/beta parameters blend local equalization,
+    sharpening, and pass-through. The CUDA backend uses CuPy and cuCIM, with
+    contrast-limited adaptive histogram equalization (CLAHE) on tiles of up to
+    `2 * adaptive_radius + 1` pixels per side. Alpha and beta apply only to ITK.
+    Both backends return NumPy arrays.
     Higher attenuation is brighter unless ``invert=True``.
     """
-    raw = np.asarray(raw, dtype=np.float64)
+    if backend == "cuda":
+        try:
+            import cupy as xp
+            from cupyx.scipy import ndimage
+        except ImportError as exc:
+            raise RuntimeError("Install the qt-cuda12 or qt-cuda13 extra for CUDA radiographs") from exc
+        to_numpy = xp.asnumpy
+    elif backend == "cpu":
+        from scipy import ndimage
+
+        xp = np
+        to_numpy = np.asarray
+    else:
+        raise ValueError(f"Unknown radiograph backend: {backend}")
+
+    raw = xp.asarray(raw, dtype=xp.float64)
     if raw.ndim != 2 or raw.size == 0:
         raise ValueError("raw must be a nonempty 2D array")
     if (flat is None) == (i0 is None):
@@ -95,18 +114,19 @@ def process_radiograph(
     if not (0 <= alpha <= 1 and 0 <= beta <= 1):
         raise ValueError("alpha and beta must lie in [0, 1]")
 
-    dark = _frame(dark, raw.shape, "dark")
+    dark = _frame(dark, raw.shape, "dark", xp)
     if flat is not None:
-        flat_frame = _frame(flat, raw.shape, "flat")
+        flat_frame = _frame(flat, raw.shape, "flat", xp)
         denominator = flat_frame - dark
     else:
         if not np.isfinite(i0) or i0 <= 0:
             raise ValueError("i0 must be positive and finite")
-        denominator = np.full(raw.shape, i0)
+        denominator = i0
 
+    # CuPy follows IEEE floating-point semantics without NumPy's warnings.
     with np.errstate(invalid="ignore", over="ignore"):
         signal = raw - dark
-    invalid = (~np.isfinite(signal) | ~np.isfinite(denominator)
+    invalid = (~xp.isfinite(signal) | ~xp.isfinite(denominator)
                | (denominator <= min_flat_signal))
     if saturation_level is not None:
         if not np.isfinite(saturation_level):
@@ -115,58 +135,76 @@ def process_radiograph(
         if flat is not None:
             invalid |= flat_frame >= saturation_level
     if bad_pixel_mask is not None:
-        mask = np.asarray(bad_pixel_mask, dtype=bool)
+        mask = xp.asarray(bad_pixel_mask, dtype=bool)
         if mask.shape != raw.shape:
             raise ValueError("bad_pixel_mask must match raw.shape")
         invalid |= mask
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         transmission = signal / denominator
-    invalid |= ~np.isfinite(transmission)
-    if invalid.all():
-        raise ValueError("No valid detector pixels remain")
+    invalid |= ~xp.isfinite(transmission)
     if invalid.any():
+        if invalid.all():
+            raise ValueError("No valid detector pixels remain")
         nearest = ndimage.distance_transform_edt(
             invalid, return_distances=False, return_indices=True
         )
         transmission[invalid] = transmission[tuple(nearest[:, invalid])]
     clipped = transmission <= transmission_floor
-    attenuation = -np.log(np.maximum(transmission, transmission_floor))
-    attenuation = attenuation.astype(np.float32)
+    attenuation = -xp.log(xp.maximum(transmission, transmission_floor))
+    attenuation = attenuation.astype(xp.float32)
 
-    roi = np.ones(raw.shape, dtype=bool)
+    roi = None
     if display_mask is not None:
-        roi = np.asarray(display_mask, dtype=bool)
+        roi = xp.asarray(display_mask, dtype=bool)
         if roi.shape != raw.shape or not roi.any():
             raise ValueError("display_mask must match raw.shape and select pixels")
 
-    display = itk.image_from_array(attenuation)
+    values = attenuation
     if median_radius:
-        display = itk.median_image_filter(display, radius=median_radius)
-    values = itk.array_from_image(display)
-    lower, upper = np.percentile(values[roi], (low, high))
+        if backend == "cuda":
+            values = ndimage.median_filter(values, size=2 * median_radius + 1, mode="nearest")
+        else:
+            import itk
+
+            display = itk.median_image_filter(itk.image_from_array(values), radius=median_radius)
+            values = itk.array_from_image(display)
+    lower, upper = xp.percentile(values if roi is None else values[roi], (low, high))
     if upper <= lower:
-        normalized = np.zeros(raw.shape, dtype=np.float32)
+        normalized = xp.zeros(raw.shape, dtype=xp.float32)
     else:
-        normalized = np.clip((values - lower) / (upper - lower), 0, 1)
+        normalized = xp.clip((values - lower) / (upper - lower), 0, 1)
         if equalization == "adaptive":
-            enhanced = itk.adaptive_histogram_equalization_image_filter(
-                itk.image_from_array(normalized.astype(np.float32)),
-                radius=adaptive_radius, alpha=alpha, beta=beta,
-            )
-            normalized = np.clip(itk.array_from_image(enhanced), 0, 1)
+            if backend == "cuda":
+                if adaptive_radius:
+                    try:
+                        from cucim.skimage.exposure import equalize_adapthist
+                    except ImportError as exc:
+                        raise RuntimeError("Install the qt-cuda12 or qt-cuda13 extra for CUDA radiographs") from exc
+                    tile_shape = tuple(min(2 * adaptive_radius + 1, size) for size in raw.shape)
+                    normalized = equalize_adapthist(normalized, kernel_size=tile_shape)
+            else:
+                import itk
+
+                enhanced = itk.adaptive_histogram_equalization_image_filter(
+                    itk.image_from_array(normalized.astype(np.float32)),
+                    radius=adaptive_radius, alpha=alpha, beta=beta,
+                )
+                normalized = np.clip(itk.array_from_image(enhanced), 0, 1)
         elif equalization == "global":
             # Empirical CDF; equal values receive equal intensities.
-            levels, counts = np.unique(normalized[roi], return_counts=True)
-            cdf = np.cumsum(counts, dtype=np.float64)
+            samples = normalized if roi is None else normalized[roi]
+            levels, counts = xp.unique(samples, return_counts=True)
+            cdf = xp.cumsum(counts, dtype=xp.float64)
             if cdf[-1] > cdf[0]:
                 cdf = (cdf - cdf[0]) / (cdf[-1] - cdf[0])
-                normalized = np.interp(normalized, levels, cdf)
+                normalized = xp.interp(normalized, levels, cdf)
     if invert:
         normalized = 1 - normalized
-    normalized[~roi] = 0
+    if roi is not None:
+        normalized[~roi] = 0
     return Radiograph(
-        attenuation=attenuation,
-        display=np.rint(normalized * 65535).astype(np.uint16),
-        repaired_pixels=invalid,
-        clipped_pixels=clipped,
+        attenuation=to_numpy(attenuation),
+        display=to_numpy(xp.rint(normalized * 65535).astype(xp.uint16)),
+        repaired_pixels=to_numpy(invalid),
+        clipped_pixels=to_numpy(clipped),
     )
