@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import os
 import ctypes
+import threading
+from dataclasses import dataclass
 import math
 import sys
 from pathlib import Path
@@ -496,6 +498,137 @@ class FloatInputRow(QWidget):
         self.input.setText(self._format_value(self._value))
 
 
+@dataclass(frozen=True)
+class RenderState:
+    volume: PreprocessedVolume
+    geometry: CarmGeometry
+    realism: RealismSettings
+    rotation: tuple
+    translation: tuple
+
+    def matches(self, other):
+        return (self.volume is other.volume and self.geometry == other.geometry
+                and self.realism == other.realism and self.rotation == other.rotation
+                and self.translation == other.translation)
+
+
+class RenderWorker(threading.Thread):
+    """Own the renderer and CUDA processing; exchange bounded mailboxes with Qt.
+
+    Only one pending request and one completed result are retained. CUDA work
+    finishes on this thread before publishing arrays, so the GUI can use its
+    own stream safely. No QWidget or OpenGL operation runs here.
+    """
+
+    def __init__(self):
+        super().__init__(name="XrayRenderWorker", daemon=False)
+        self._condition = threading.Condition()
+        self._pending = self._result = None
+        self._stopping = False
+        self.simulator = None
+        self._sensor_image = None
+        self._sensor_state = None
+
+    def submit(self, generation, state):
+        with self._condition:
+            self._pending = (generation, state)
+            self._condition.notify()
+
+    def take_result(self):
+        with self._condition:
+            result, self._result = self._result, None
+            return result
+
+    def stop(self):
+        with self._condition:
+            self._stopping = True
+            self._pending = self._result = None
+            self._condition.notify()
+
+    def run(self):
+        try:
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._stopping or self._pending is not None)
+                    if self._stopping:
+                        return
+                    generation, state = self._pending
+                    self._pending = None
+                try:
+                    import cupy as cp
+
+                    # A separate stream prevents GUI uploads from waiting for
+                    # the worker's next frame on the default stream.
+                    with cp.cuda.Device(0), cp.cuda.Stream(non_blocking=True):
+                        raw, display = self._render(state)
+                    result = (generation, state, raw, display, None)
+                except Exception as exc:
+                    result = (generation, state, None, None, str(exc))
+                with self._condition:
+                    if not self._stopping:
+                        self._result = result
+        finally:
+            # Destroy Slang resources on their owning thread after GPU work.
+            self._sensor_image = None
+            self.simulator = None
+
+    def _render(self, state):
+        import cupy as cp
+
+        if self.simulator is None or self.simulator.volume is not state.volume:
+            config = SimulatorConfig(geometry=state.geometry, physics=DEFAULT_PHYSICS,
+                                     realism=RealismSettings(enabled=False))
+            self.simulator = xray_simulator(state.volume, config)
+            self._sensor_image = None
+        elif self.simulator.config.geometry != state.geometry:
+            self.simulator.update_geometry(state.geometry)
+            self._sensor_image = None
+        previous = self._sensor_state
+        if (self._sensor_image is None or previous is None
+                or previous.rotation != state.rotation or previous.translation != state.translation):
+            batch = self.simulator.renderer.render_batch(
+                np.asarray([state.rotation], dtype=np.float32),
+                np.asarray([state.translation], dtype=np.float32), as_torch=True)
+            if not batch.is_cuda:
+                raise RuntimeError("The viewer requires the CUDA rendering backend")
+            self._sensor_image = cp.from_dlpack(batch[0])
+            self._sensor_state = state
+        sensor = self._apply_gpu_realism(self._sensor_image, state.realism)
+        radiograph = process_radiograph(
+            sensor, i0=self.simulator.config.physics.i0, backend="cuda",
+            equalization="adaptive", median_radius=0, adaptive_radius=16,
+            percentiles=(0.1, 99.9))
+        raw = self._format_raw_for_display(sensor)
+        cp.cuda.get_current_stream().synchronize()
+        return raw, radiograph.display
+
+    def _apply_gpu_realism(self, image, cfg):
+        """Apply the viewer's detector noise and blur controls on the GPU."""
+        import cupy as cp
+        from cupyx.scipy.ndimage import gaussian_filter
+
+        if not cfg.enabled:
+            return image
+        out = cp.maximum(image * cfg.gain + cfg.bias, 0)
+        rng = cp.random.RandomState(cfg.seed)
+        if cfg.poisson_photons > 0:
+            out = rng.poisson(out * cfg.poisson_photons).astype(cp.float32) / cfg.poisson_photons
+        if cfg.gaussian_sigma > 0:
+            out = cp.maximum(out + rng.normal(0, cfg.gaussian_sigma, out.shape).astype(cp.float32), 0)
+        if cfg.blur_sigma_px > 0:
+            out = gaussian_filter(out, cfg.blur_sigma_px)
+        return out
+
+    def _format_raw_for_display(self, image):
+        """Stretch linear intensities to uint16 using device operations only."""
+        import cupy as cp
+
+        low, high = image.min(), image.max()
+        span = high - low
+        normalized = cp.where(span > 0, (image - low) / cp.maximum(span, 1e-20), 0)
+        return cp.rint(cp.clip(1 - normalized, 0, 1) * 65535).astype(cp.uint16)
+
+
 class XraySimulatorWindow(QMainWindow):
     """Main GUI window."""
 
@@ -506,14 +639,12 @@ class XraySimulatorWindow(QMainWindow):
 
         self.volume: PreprocessedVolume = load_cached_volume()
         self.realism_enabled = False
-        self.simulator: xray_simulator | None = None
-        self.current_rotation = self.current_translation = None
-        self._sensor_image = None
-        self._current_realism = None
-        self._needs_simulator_reset = True
+        self._last_state = None
+        self._generation = 0
+        self._worker = RenderWorker()
+        self._worker.start()
 
         self.render_timer = QTimer(self)
-        #self.render_timer.setSingleShot(True)
         self.render_timer.timeout.connect(self.render_current_view)
 
         self._build_ui()
@@ -653,29 +784,6 @@ class XraySimulatorWindow(QMainWindow):
             seed=0,
         )
 
-    def _rebuild_simulator_if_needed(self) -> bool:
-        sid = self.geometry_sliders["sid"].value()
-        sdd = max(self.geometry_sliders["sdd"].value(), sid + 1.0)
-
-        if sdd != self.geometry_sliders["sdd"].value():
-            self.geometry_sliders["sdd"].set_value(sdd)
-
-        geometry = self.geometry_controls()
-        if self.simulator is None or self._needs_simulator_reset:
-            config = SimulatorConfig(
-                geometry=geometry,
-                physics=DEFAULT_PHYSICS,
-                realism=RealismSettings(enabled=False),
-            ).with_output(keep_intensity=True)
-            self.simulator = xray_simulator(self.volume, config)
-            self._sensor_image = None
-            self._needs_simulator_reset = False
-            return True
-        if self.simulator.config.geometry != geometry:
-            self.simulator.update_geometry(geometry)
-            return True
-        return False
-
     def rotation_controls(self) -> tuple[float, float, float]:
         return (
             math.radians(self.pose_sliders["rx"].value() - 90.0),
@@ -691,81 +799,45 @@ class XraySimulatorWindow(QMainWindow):
         )
 
     def render_current_view(self) -> None:
+        """Poll completed GPU images and replace the worker's pending request."""
+        sid = self.geometry_sliders["sid"].value()
+        if self.geometry_sliders["sdd"].value() <= sid:
+            self.geometry_sliders["sdd"].set_value(sid + 1)
+        state = RenderState(self.volume, self.geometry_controls(), self.realism_controls(),
+                            self.rotation_controls(), self.translation_controls())
+        if self._last_state is None or not state.matches(self._last_state):
+            self._generation += 1
+            self._last_state = state
+            self._worker.submit(self._generation, state)
+        result = self._worker.take_result()
+        if result is None:
+            return
+        generation, state, raw, display, error = result
+        if error is not None:
+            self.render_timer.stop()
+            self._set_status(f"Render failed: {error}")
+            QMessageBox.critical(self, "Render Error", error)
+            return
+        # Show completed previews during motion, but never show an old CT.
+        # The next dispatch always takes the latest settings, not a FIFO queue.
+        if state.volume is not self.volume:
+            return
         try:
-            simulator_changed = self._rebuild_simulator_if_needed()
-            assert self.simulator is not None
-            realism = self.realism_controls()
-            do_render = ( simulator_changed
-                         or self._sensor_image is None
-                         or self.current_rotation != self.rotation_controls()
-                         or self.current_translation != self.translation_controls()
+            self.raw_image_view.set_image(raw)
+            self.image_view.set_image(display)
+            self._set_status(
+                f"Rendered {display.shape[1]}x{display.shape[0]} frame from "
+                f"{state.volume.metadata.source or 'synthetic volume'}."
             )
-            if do_render:
-                self.current_rotation = self.rotation_controls()
-                self.current_translation = self.translation_controls()
-                import cupy as cp
-
-                # Batch size one uses the renderer's CUDA buffer export, avoiding
-                # render_frame's NumPy readback and CPU display/realism stages.
-                batch = self.simulator.renderer.render_batch(
-                    np.asarray([self.current_rotation], dtype=np.float32),
-                    np.asarray([self.current_translation], dtype=np.float32),
-                    as_torch=True,
-                )
-                if not batch.is_cuda:
-                    raise RuntimeError("The viewer requires the CUDA rendering backend")
-                self._sensor_image = cp.from_dlpack(batch[0])
-            if do_render or realism != self._current_realism:
-                sensor = self._apply_gpu_realism(self._sensor_image, realism)
-                radiograph = process_radiograph(
-                    sensor,
-                    i0=self.simulator.config.physics.i0,
-                    backend="cuda",
-                    equalization="adaptive",
-                    median_radius=0,
-                    adaptive_radius=16,
-                    percentiles=(0.1, 99.9),
-                )
-                self.raw_image_view.set_image(self._format_raw_for_display(sensor))
-                self.image_view.set_image(radiograph.display)
-                self._current_realism = realism
-                self._set_status(
-                    f"Rendered {sensor.shape[1]}x{sensor.shape[0]} frame from "
-                    f"{self.volume.metadata.source or 'synthetic volume'}."
-                )
         except Exception as exc:
             self.render_timer.stop()
-            self._set_status(f"Render failed: {exc}")
-            QMessageBox.critical(self, "Render Error", str(exc))
-
-    def _apply_gpu_realism(self, image, cfg):
-        """Apply the viewer's detector noise and blur controls on the GPU."""
-        import cupy as cp
-        from cupyx.scipy.ndimage import gaussian_filter
-
-        if not cfg.enabled:
-            return image
-        out = cp.maximum(image * cfg.gain + cfg.bias, 0)
-        rng = cp.random.RandomState(cfg.seed)
-        if cfg.poisson_photons > 0:
-            out = rng.poisson(out * cfg.poisson_photons).astype(cp.float32) / cfg.poisson_photons
-        if cfg.gaussian_sigma > 0:
-            out = cp.maximum(out + rng.normal(0, cfg.gaussian_sigma, out.shape).astype(cp.float32), 0)
-        if cfg.blur_sigma_px > 0:
-            out = gaussian_filter(out, cfg.blur_sigma_px)
-        return out
-
-    def _format_raw_for_display(self, image):
-        """Stretch linear intensities to uint16 using device operations only."""
-        import cupy as cp
-
-        low, high = image.min(), image.max()
-        span = high - low
-        normalized = cp.where(span > 0, (image - low) / cp.maximum(span, 1e-20), 0)
-        return cp.rint(cp.clip(1 - normalized, 0, 1) * 65535).astype(cp.uint16)
+            self._set_status(f"Display failed: {exc}")
+            QMessageBox.critical(self, "Display Error", str(exc))
 
     def closeEvent(self, event):  # noqa: N802
         self.render_timer.stop()
+        self._worker.stop()
+        self._worker.join()
         for view in (self.raw_image_view, self.image_view):
             if view.isValid():
                 view.cleanup()
@@ -803,7 +875,6 @@ class XraySimulatorWindow(QMainWindow):
         try:
             path = Path(path_str)
             self.volume = load_ct_volume_from_path(path)
-            self._needs_simulator_reset = True
             self._set_status(f"Loaded: {path}")
         except Exception as exc:
             self._set_status(f"Load failed: {exc}")
