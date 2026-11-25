@@ -369,9 +369,11 @@ class SliderRow(QWidget):
         value: int,
         scale: float = 1.0,
         parent: QWidget | None = None,
+        decimals: int = 2,
     ) -> None:
         super().__init__(parent)
         self.scale = scale
+        self.decimals = decimals
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -393,7 +395,7 @@ class SliderRow(QWidget):
         self._sync_label(value)
 
     def _sync_label(self, value: int) -> None:
-        self.value_label.setText(f"{value / self.scale:.2f}")
+        self.value_label.setText(f"{value / self.scale:.{self.decimals}f}")
 
     def value(self) -> float:
         return self.slider.value() / self.scale
@@ -520,12 +522,14 @@ class RenderState:
     rotation: tuple
     translation: tuple
     preview: bool = False
+    blur_scale_yx: tuple[float, float] = (1.0, 1.0)
 
     def matches(self, other):
         return (self.volume is other.volume and self.geometry == other.geometry
                 and self.realism == other.realism and self.rotation == other.rotation
                 and self.translation == other.translation
-                and self.preview == other.preview)
+                and self.preview == other.preview
+                and self.blur_scale_yx == other.blur_scale_yx)
 
 
 class RenderWorker(threading.Thread):
@@ -609,7 +613,7 @@ class RenderWorker(threading.Thread):
                 raise RuntimeError("The viewer requires the CUDA rendering backend")
             self._sensor_image = cp.from_dlpack(batch[0])
             self._sensor_state = state
-        sensor = self._apply_gpu_realism(self._sensor_image, state.realism)
+        sensor = self._apply_gpu_realism(self._sensor_image, state.realism, state.blur_scale_yx)
         radiograph = process_radiograph(
             sensor, i0=self.simulator.config.physics.i0, backend="cuda",
             equalization="adaptive", median_radius=0, adaptive_radius=16,
@@ -618,7 +622,7 @@ class RenderWorker(threading.Thread):
         cp.cuda.get_current_stream().synchronize()
         return raw, radiograph.display
 
-    def _apply_gpu_realism(self, image, cfg):
+    def _apply_gpu_realism(self, image, cfg, blur_scale_yx=(1.0, 1.0)):
         """Apply the viewer's detector noise and blur controls on the GPU."""
         import cupy as cp
         from cupyx.scipy.ndimage import gaussian_filter
@@ -632,7 +636,10 @@ class RenderWorker(threading.Thread):
         if cfg.gaussian_sigma > 0:
             out = cp.maximum(out + rng.normal(0, cfg.gaussian_sigma, out.shape).astype(cp.float32), 0)
         if cfg.blur_sigma_px > 0:
-            out = gaussian_filter(out, cfg.blur_sigma_px)
+            # Slider sigma is measured in full-resolution detector pixels.
+            # Preview pixels cover a larger area, independently on each axis.
+            sigma = tuple(cfg.blur_sigma_px * scale for scale in blur_scale_yx)
+            out = gaussian_filter(out, sigma)
         return out
 
     def _format_raw_for_display(self, image):
@@ -676,7 +683,7 @@ class XraySimulatorWindow(QMainWindow):
         ) for row in group.values()]
         for slider in self._drag_sliders:
             slider.sliderPressed.connect(self.render_current_view)
-            slider.sliderReleased.connect(self.render_current_view)
+            slider.sliderReleased.connect(lambda slider=slider: self._slider_released(slider))
         self._set_status("Simulation is initializing…")
         self.render_timer.start(33)  # Start rendering at 30 fps immediately after UI is shown
 
@@ -719,8 +726,8 @@ class XraySimulatorWindow(QMainWindow):
         geometry_group = QGroupBox("Geometry")
         geometry_layout = QVBoxLayout(geometry_group)
         self.geometry_sliders: dict[str, SliderRow] = {
-            "sdd": SliderRow("Source-Detector [mm]", 300, 3000, int(DEFAULT_GEOMETRY.source_to_detector_mm)),
-            "sid": SliderRow("Source-Iso [mm]", 250, 2950, int(DEFAULT_GEOMETRY.source_to_isocenter_mm)),
+            "sdd": SliderRow("Source-Detector [mm]", 300, 3000, int(DEFAULT_GEOMETRY.source_to_detector_mm), decimals=0),
+            "sid": SliderRow("Source-Iso [mm]", 250, 2950, int(DEFAULT_GEOMETRY.source_to_isocenter_mm), decimals=0),
         }
         for slider in self.geometry_sliders.values():
             geometry_layout.addWidget(slider)
@@ -742,12 +749,12 @@ class XraySimulatorWindow(QMainWindow):
         pose_group = QGroupBox("Pose")
         pose_layout = QVBoxLayout(pose_group)
         self.pose_sliders: dict[str, SliderRow] = {
-           "rx": SliderRow("X Rotation [deg]", -1800, 1800, 0, scale=10.0),
-            "ry": SliderRow("Y Rotation [deg]", -1800, 1800, 0, scale=10.0),
-            "rz": SliderRow("Z Rotation [deg]", -1800, 1800, 0, scale=10.0),
-            "tx": SliderRow("X Translation [mm]", -1500, 1500, 0),
-            "ty": SliderRow("Y Translation [mm]", -1500, 1500, 0),
-            "tz": SliderRow("Z Translation [mm]", -1500, 1500, 0),
+            "rx": SliderRow("X Rotation [deg]", -180, 180, 0, decimals=0),
+            "ry": SliderRow("Y Rotation [deg]", -180, 180, 0, decimals=0),
+            "rz": SliderRow("Z Rotation [deg]", -180, 180, 0, decimals=0),
+            "tx": SliderRow("X Translation [mm]", -1500, 1500, 0, decimals=0),
+            "ty": SliderRow("Y Translation [mm]", -1500, 1500, 0, decimals=0),
+            "tz": SliderRow("Z Translation [mm]", -1500, 1500, 0, decimals=0),
         }
         for slider in self.pose_sliders.values():
             pose_layout.addWidget(slider)
@@ -762,9 +769,9 @@ class XraySimulatorWindow(QMainWindow):
         self.realism_sliders_group = QGroupBox("Realism Sliders")
         realism_sliders_layout = QVBoxLayout(self.realism_sliders_group)
         self.realism_sliders: dict[str, SliderRow] = {
-            "poisson": SliderRow("Poisson Noise [photons]", 0, 100, 0, scale=0.01),
+            "poisson": SliderRow("Poisson Noise [photons]", 0, 100, 0, scale=0.01, decimals=0),
             "gaussian": SliderRow("Gaussian Noise Sigma", 0, 100, 0, scale=400.0),
-            "blur": SliderRow("Gaussian Blur [px]", 0, 100, 0, scale=10.0),
+            "blur": SliderRow("Gaussian Blur [px]", 0, 20, 0, decimals=0),
         }
         for slider in self.realism_sliders.values():
             realism_sliders_layout.addWidget(slider)
@@ -842,6 +849,15 @@ class XraySimulatorWindow(QMainWindow):
             self.pose_sliders["tz"].value(),
         )
 
+    def _slider_released(self, slider) -> None:
+        """Snap rotation landmarks before requesting the final-resolution frame."""
+        if any(slider is self.pose_sliders[key].slider for key in ("rx", "ry", "rz")):
+            for target in (-90, 0, 90):
+                if abs(slider.value() - target) <= 2:
+                    slider.setValue(target)
+                    break
+        self.render_current_view()
+
     def render_current_view(self) -> None:
         """Poll completed GPU images and replace the worker's pending request."""
         sid = self.geometry_sliders["sid"].value()
@@ -849,10 +865,16 @@ class XraySimulatorWindow(QMainWindow):
             self.geometry_sliders["sdd"].set_value(sid + 1)
         preview = any(slider.isSliderDown() for slider in self._drag_sliders)
         geometry = self.geometry_controls()
+        blur_scale_yx = (1.0, 1.0)
         if preview:
+            full_geometry = geometry
             geometry = preview_geometry(geometry)
+            blur_scale_yx = (
+                geometry.detector_height_px / full_geometry.detector_height_px,
+                geometry.detector_width_px / full_geometry.detector_width_px,
+            )
         state = RenderState(self.volume, geometry, self.realism_controls(),
-                            self.rotation_controls(), self.translation_controls(), preview)
+                            self.rotation_controls(), self.translation_controls(), preview, blur_scale_yx)
         if self._last_state is None or not state.matches(self._last_state):
             self._generation += 1
             self._last_state = state

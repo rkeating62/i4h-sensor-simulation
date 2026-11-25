@@ -71,3 +71,34 @@ def test_preview_preserves_detector_field_of_view(width, height, dx, dy):
     assert preview.detector_offset_xy_mm == original.detector_offset_xy_mm
     assert preview.source_to_detector_mm == original.source_to_detector_mm
     assert preview.source_to_isocenter_mm == original.source_to_isocenter_mm
+
+
+@pytest.mark.gpu
+def test_blur_has_same_physical_width_in_preview_and_full_resolution():
+    cp = pytest.importorskip('cupy')
+    pytest.importorskip('PySide6')
+    try:
+        if not cp.cuda.runtime.getDeviceCount():
+            pytest.skip('CUDA device required')
+    except cp.cuda.runtime.CUDARuntimeError:
+        pytest.skip('CUDA unavailable')
+    from examples.xray_interactive_view_qt import RenderWorker
+    from xray_simulator import RealismSettings
+
+    worker = RenderWorker()
+    cfg = RealismSettings(enabled=True, blur_sigma_px=12, gaussian_sigma=0,
+                          poisson_photons=0)
+    widths = []
+    for shape, scale in [((192, 192), (1., 1.)), ((48, 64), (.25, 1/3))]:
+        image = cp.zeros(shape, dtype=cp.float32)
+        image[shape[0] // 2, shape[1] // 2] = 1
+        blurred = worker._apply_gpu_realism(image, cfg, scale)
+        # Second moment of the impulse response, in full-detector pixel units.
+        y, x = cp.indices(shape)
+        variance = [cp.sum(blurred * ((coord - size // 2) / pitch)**2) / blurred.sum()
+                    for coord, size, pitch in zip((y, x), shape, scale)]
+        widths.append([float(cp.sqrt(value)) for value in variance])
+        assert float(blurred.max()) < 1
+        assert float(image.max()) == 1  # Cached sensor remains unmodified.
+    assert widths[0] == pytest.approx([12, 12], rel=.002)
+    assert widths[1] == pytest.approx(widths[0], rel=.002)
