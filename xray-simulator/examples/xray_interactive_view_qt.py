@@ -616,8 +616,10 @@ class RenderWorker(threading.Thread):
         sensor = self._apply_gpu_realism(self._sensor_image, state.realism, state.blur_scale_yx)
         radiograph = process_radiograph(
             sensor, i0=self.simulator.config.physics.i0, backend="cuda",
-            equalization="adaptive", median_radius=0, adaptive_radius=16,
-            percentiles=(0.1, 99.9))
+            equalization="none" if state.preview else "adaptive",
+            precision="float32" if state.preview else "float64",
+            percentile_stride=4 if state.preview else 1,
+            median_radius=0, adaptive_radius=16, percentiles=(0.1, 99.9))
         raw = self._format_raw_for_display(sensor)
         cp.cuda.get_current_stream().synchronize()
         return raw, radiograph.display

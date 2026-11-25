@@ -32,8 +32,8 @@ class Radiograph:
         return itk.image_from_array(attenuation[np.newaxis, ...])
 
 
-def _frame(value, shape, name, xp):
-    result = xp.asarray(value, dtype=xp.float64)
+def _frame(value, shape, name, xp, dtype):
+    result = xp.asarray(value, dtype=dtype)
     if result.ndim == 0:
         return result
     if result.shape != shape:
@@ -60,6 +60,8 @@ def process_radiograph(
     beta: float = 0.3,
     invert: bool = False,
     backend: Literal["cpu", "cuda"] = "cpu",
+    precision: Literal["float32", "float64"] = "float64",
+    percentile_stride: int = 1,
 ) -> Radiograph:
     """Convert raw counts into calibrated attenuation and a display radiograph.
 
@@ -84,6 +86,12 @@ def process_radiograph(
     The CPU backend returns NumPy arrays. The CUDA backend accepts CuPy arrays
     or CUDA tensors supporting DLPack and returns CuPy arrays; detector and
     radiograph images stay on the GPU. Validation may synchronize scalar flags.
+    ``precision="float32"`` reduces calibration memory and arithmetic costs for
+    interactive previews of simulated signals. Float64 remains the default for
+    measured exposures where dark subtraction may require extra precision.
+    ``percentile_stride`` samples every Nth row and column for display window
+    estimation only; attenuation and output images retain their full shape.
+    A sampled ROI with no selected pixels falls back to all selected pixels.
     Higher attenuation is brighter unless ``invert=True``.
     """
     if backend == "cuda":
@@ -101,7 +109,13 @@ def process_radiograph(
 
     if backend == "cuda" and not isinstance(raw, np.ndarray) and hasattr(raw, "__dlpack__"):
         raw = xp.from_dlpack(raw)
-    raw = xp.asarray(raw, dtype=xp.float64)
+    if precision not in {"float32", "float64"}:
+        raise ValueError("precision must be float32 or float64")
+    if (not isinstance(percentile_stride, int) or isinstance(percentile_stride, bool)
+            or percentile_stride < 1):
+        raise ValueError("percentile_stride must be a positive integer")
+    dtype = xp.float32 if precision == "float32" else xp.float64
+    raw = xp.asarray(raw, dtype=dtype)
     if raw.ndim != 2 or raw.size == 0:
         raise ValueError("raw must be a nonempty 2D array")
     if (flat is None) == (i0 is None):
@@ -120,9 +134,9 @@ def process_radiograph(
     if not (0 <= alpha <= 1 and 0 <= beta <= 1):
         raise ValueError("alpha and beta must lie in [0, 1]")
 
-    dark = _frame(dark, raw.shape, "dark", xp)
+    dark = _frame(dark, raw.shape, "dark", xp, dtype)
     if flat is not None:
-        flat_frame = _frame(flat, raw.shape, "flat", xp)
+        flat_frame = _frame(flat, raw.shape, "flat", xp, dtype)
         denominator = flat_frame - dark
     else:
         if not np.isfinite(i0) or i0 <= 0:
@@ -174,7 +188,12 @@ def process_radiograph(
 
             display = itk.median_image_filter(itk.image_from_array(values), radius=median_radius)
             values = itk.array_from_image(display)
-    lower, upper = xp.percentile(values if roi is None else values[roi], (low, high))
+    samples = values[::percentile_stride, ::percentile_stride]
+    if roi is not None:
+        samples = samples[roi[::percentile_stride, ::percentile_stride]]
+        if samples.size == 0:
+            samples = values[roi]
+    lower, upper = xp.percentile(samples, (low, high)).astype(dtype)
     if upper <= lower:
         normalized = xp.zeros(raw.shape, dtype=xp.float32)
     else:

@@ -133,3 +133,32 @@ def test_qt_interop_upload_resize_and_cleanup(cupy):
                 view.cleanup()
             view.close()
         app.processEvents()
+
+
+def test_preview_precision_and_subsampled_window():
+    raw = np.linspace(.01, 1, 48 * 64, dtype=np.float32).reshape(48, 64)
+    options = dict(i0=1, median_radius=0, equalization='none', percentiles=(1, 99))
+    reference = process_radiograph(raw, **options)
+    preview = process_radiograph(raw, **options, precision='float32', percentile_stride=4)
+    np.testing.assert_allclose(preview.attenuation, reference.attenuation, atol=1e-6)
+    lower, upper = np.percentile(preview.attenuation[::4, ::4], (1, 99)).astype(np.float32)
+    expected = np.rint(np.clip((preview.attenuation - lower) / (upper - lower), 0, 1) * 65535)
+    np.testing.assert_array_equal(preview.display, expected.astype(np.uint16))
+    assert preview.display.shape == raw.shape
+
+
+def test_subsampling_falls_back_for_sparse_roi():
+    raw = np.linspace(.1, 1, 64, dtype=np.float32).reshape(8, 8)
+    roi = np.zeros_like(raw, dtype=bool)
+    roi[1, 1:4] = True
+    options = dict(i0=1, median_radius=0, equalization='none', display_mask=roi)
+    full = process_radiograph(raw, **options)
+    sampled = process_radiograph(raw, **options, percentile_stride=4)
+    np.testing.assert_array_equal(sampled.display, full.display)
+
+
+@pytest.mark.parametrize('kwargs', [dict(precision='float16'), dict(percentile_stride=0),
+                                    dict(percentile_stride=1.5), dict(percentile_stride=True)])
+def test_invalid_preview_options(kwargs):
+    with pytest.raises(ValueError):
+        process_radiograph(np.ones((4, 4)), i0=1, **kwargs)
