@@ -102,3 +102,22 @@ def test_blur_has_same_physical_width_in_preview_and_full_resolution():
         assert float(image.max()) == 1  # Cached sensor remains unmodified.
     assert widths[0] == pytest.approx([12, 12], rel=.002)
     assert widths[1] == pytest.approx(widths[0], rel=.002)
+
+
+@pytest.mark.parametrize('axis', [0, 1, 2])
+@pytest.mark.parametrize('angle', [-90, -30, 0, 30, 90])
+def test_viewer_rotation_uses_labeled_world_axis(axis, angle):
+    pytest.importorskip('PySide6')
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+    from examples.xray_interactive_view_qt import viewer_rotation
+    from xray_simulator.geometry import euler_zxy_to_matrix
+
+    angles = [0., 0., 0.]
+    angles[axis] = angle
+    initial = Rotation.from_rotvec([-np.pi / 2, 0, 0]).as_matrix()
+    rotation_vector = np.zeros(3)
+    rotation_vector[axis] = np.deg2rad(angle)
+    expected = Rotation.from_rotvec(rotation_vector).as_matrix() @ initial
+    actual = euler_zxy_to_matrix(viewer_rotation(tuple(angles)))
+    np.testing.assert_allclose(actual, expected, atol=1e-7)

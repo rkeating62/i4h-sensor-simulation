@@ -38,6 +38,7 @@ from xray_simulator import (
     xray_simulator,
 )
 from xray_simulator.radiograph import process_radiograph
+from xray_simulator.geometry import euler_zxy_to_matrix, matrix_to_euler_zxy
 
 try:
     from PySide6.QtCore import QTimer, Qt
@@ -577,6 +578,18 @@ class FloatInputRow(QWidget):
         self.input.setText(self._format_value(self._value))
 
 
+def viewer_rotation(angles_deg: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Compose world-axis slider offsets with the initial AP orientation.
+
+    Offsets use Rz @ Rx @ Ry; the AP basis is applied separately on the right.
+    Adding -90 directly to rx would couple the Y and Z sliders at zero pose.
+    Convert the final matrix to the renderer's ZXY representation only once.
+    """
+    offsets = euler_zxy_to_matrix(tuple(math.radians(angle) for angle in angles_deg))
+    initial = euler_zxy_to_matrix((-math.pi / 2, 0.0, 0.0))
+    return matrix_to_euler_zxy(offsets @ initial)
+
+
 def preview_geometry(geometry: CarmGeometry) -> CarmGeometry:
     """Use 768 rows x 1024 columns over the same physical detector area."""
     dy = geometry.pixel_spacing_y_mm
@@ -927,11 +940,7 @@ class XraySimulatorWindow(QMainWindow):
         )
 
     def rotation_controls(self) -> tuple[float, float, float]:
-        return (
-            math.radians(self.pose_sliders["rx"].value() - 90.0),
-            math.radians(self.pose_sliders["ry"].value()),
-            math.radians(self.pose_sliders["rz"].value()),
-        )
+        return viewer_rotation(tuple(self.pose_sliders[key].value() for key in ("rx", "ry", "rz")))
 
     def translation_controls(self) -> tuple[float, float, float]:
         return (
