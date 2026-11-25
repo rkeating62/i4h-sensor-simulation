@@ -202,17 +202,23 @@ def _cuda_result(result):
 class CudaImageView(QOpenGLWidget):
     """Display a CuPy uint16 image through a CUDA-registered pixel buffer.
 
-    Map/copy/unmap runs on the producing CuPy stream. CUDA's interop barriers
-    order the GL texture upload after the device copy without host readback.
-    Resources belong to this widget's GL context and are recreated on resize
-    of the detector or on Qt context replacement.
+    Two registered pixel buffers rotate on a dedicated CUDA upload stream.
+    CUDA events retain sources until unmap completes; GL fences protect buffers
+    until texture transfers finish. Completion is polled without CPU waits.
+    Resources belong to this widget's GL context. Only teardown waits for work.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(320, 320)
-        self._resource = None
-        self._pbo = self._texture = self._program = self._vao = 0
+        self._slots = []
+        self._pending_image = None
+        self._retired_sources = []
+        self._upload_stream = None
+        self._texture = self._program = self._vao = 0
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(5)
+        self._poll_timer.timeout.connect(self.update)
         self._shape = None
         self._image = None
         self._error = None
@@ -225,6 +231,9 @@ class CudaImageView(QOpenGLWidget):
             from OpenGL.GL.shaders import compileProgram, compileShader
 
             self.cp, self.cuda, self.gl = cp, runtime, GL
+            self._upload_stream = cp.cuda.Stream(non_blocking=True)
+            self._slots = [dict(pbo=0, resource=None, shape=None, event=None,
+                                source=None, fence=None, aspect=None) for _ in range(2)]
             self.context().aboutToBeDestroyed.connect(self.cleanup)
             self._program = compileProgram(
                 compileShader("""#version 330 core
@@ -249,80 +258,143 @@ class CudaImageView(QOpenGLWidget):
             self._error = exc
 
     def _release_image(self):
-        if self._resource is not None:
-            _cuda_result(self.cuda.cudaGraphicsUnregisterResource(self._resource))
-            self._resource = None
-        if self._pbo:
-            self.gl.glDeleteBuffers(1, [self._pbo])
-            self._pbo = 0
+        # Blocking teardown is intentional; normal presentation only queries
+        # events/fences. Never free a source or registered buffer still in use.
+        for source in self._retired_sources + ([self._pending_image] if self._pending_image else []):
+            source[1].synchronize()
+        self._retired_sources = []
+        for slot in self._slots:
+            if slot["event"] is not None:
+                slot["event"].synchronize()
+        if self._slots:
+            self.gl.glFinish()
+        for slot in self._slots:
+            if slot["fence"] is not None:
+                self.gl.glDeleteSync(slot["fence"])
+            if slot["resource"] is not None:
+                _cuda_result(self.cuda.cudaGraphicsUnregisterResource(slot["resource"]))
+            if slot["pbo"]:
+                self.gl.glDeleteBuffers(1, [slot["pbo"]])
+        self._slots = []
+        self._pending_image = None
         if self._texture:
             self.gl.glDeleteTextures([self._texture])
             self._texture = 0
         self._shape = None
 
     def set_image(self, image, *, display_aspect=None):
-        """Upload device pixels while this widget's OpenGL context is current."""
+        """Queue the latest device image; paintGL submits and polls uploads."""
         if not self.isValid():
             raise RuntimeError("A working NVIDIA OpenGL context is required")
-        self.makeCurrent()
-        try:
-            if self._error is not None:
-                raise RuntimeError(f"Cannot initialize CUDA–OpenGL display: {self._error}")
-            cp, GL = self.cp, self.gl
-            if not isinstance(image, cp.ndarray) or image.ndim != 2 or image.dtype != cp.uint16:
-                raise ValueError("Display expects a 2D CuPy uint16 image")
-            with image.device:
-                image = cp.ascontiguousarray(image)
+        if self._error is not None:
+            raise RuntimeError(f"Cannot present CUDA image: {self._error}")
+        cp = self.cp
+        if not isinstance(image, cp.ndarray) or image.ndim != 2 or image.dtype != cp.uint16:
+            raise ValueError("Display expects a 2D CuPy uint16 image")
+        # Record readiness on the caller's stream; no CPU wait. Worker images
+        # are already complete, but this also supports other CUDA producers.
+        with image.device:
+            image = cp.ascontiguousarray(image)
+            ready = cp.cuda.Event(disable_timing=True)
+            ready.record()
+        if self._pending_image is not None:
+            self._retired_sources.append(self._pending_image)
+        self._pending_image = (image, ready, display_aspect or image.shape[1] / image.shape[0])
+        self._poll_timer.start()
+        self.update()
+
+    def _pump_uploads(self):
+        cp, GL = self.cp, self.gl
+        self._retired_sources = [item for item in self._retired_sources if not item[1].done]
+        # Complete uploads in submission order to avoid presenting older frames
+        # after newer ones. Slots are rotated after each submission.
+        for slot in self._slots:
+            if slot["event"] is not None:
+                if not slot["event"].done:
+                    continue
+                image = slot["source"]
                 height, width = image.shape
-                if self._shape != image.shape:
-                    self._release_image()
-                    self._pbo = GL.glGenBuffers(1)
-                    GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self._pbo)
-                    GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, image.nbytes, None, GL.GL_STREAM_DRAW)
-                    self._resource, = _cuda_result(self.cuda.cudaGraphicsGLRegisterBuffer(
-                        int(self._pbo), self.cuda.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard,
-                    ))
+                GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+                if not self._texture:
                     self._texture = GL.glGenTextures(1)
-                    GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-                    GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-                    GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+                GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
+                if self._shape != image.shape:
+                    for parameter in (GL.GL_TEXTURE_MIN_FILTER, GL.GL_TEXTURE_MAG_FILTER):
+                        GL.glTexParameteri(GL.GL_TEXTURE_2D, parameter, GL.GL_LINEAR)
+                    for parameter in (GL.GL_TEXTURE_WRAP_S, GL.GL_TEXTURE_WRAP_T):
+                        GL.glTexParameteri(GL.GL_TEXTURE_2D, parameter, GL.GL_CLAMP_TO_EDGE)
                     GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_R16, width, height,
                                     0, GL.GL_RED, GL.GL_UNSIGNED_SHORT, None)
-                    self._shape = image.shape
-                stream = cp.cuda.get_current_stream()
-                # cuda-python accepts the handle wrapper for a single resource,
-                # not a Python list. The wrapper supplies the handle's address.
-                _cuda_result(self.cuda.cudaGraphicsMapResources(1, self._resource, stream.ptr))
-                try:
-                    ptr, size = _cuda_result(self.cuda.cudaGraphicsResourceGetMappedPointer(self._resource))
-                    if size < image.nbytes:
-                        raise RuntimeError("Mapped OpenGL buffer is smaller than the image")
-                    cp.cuda.runtime.memcpyAsync(int(ptr), image.data.ptr, image.nbytes,
-                                                cp.cuda.runtime.memcpyDeviceToDevice, stream.ptr)
-                finally:
-                    _cuda_result(self.cuda.cudaGraphicsUnmapResources(1, self._resource, stream.ptr))
-                # Retain the source until the asynchronous device copy completes.
-                stream.synchronize()
-                GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, self._pbo)
-                GL.glBindTexture(GL.GL_TEXTURE_2D, self._texture)
+                GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, slot["pbo"])
                 GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
                 GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, height,
-                                   GL.GL_RED, GL.GL_UNSIGNED_SHORT, ctypes.c_void_p(0))
+                                  GL.GL_RED, GL.GL_UNSIGNED_SHORT, ctypes.c_void_p(0))
+                GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+                slot["fence"] = GL.glFenceSync(GL.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+                GL.glFlush()
+                self._shape = image.shape
                 self._image = image
-                self._display_aspect = display_aspect or (width / height)
-        finally:
-            if hasattr(self, "gl"):
-                self.gl.glBindBuffer(self.gl.GL_PIXEL_UNPACK_BUFFER, 0)
-            self.doneCurrent()
-        self.update()
+                self._display_aspect = slot["aspect"]
+                slot["source"] = slot["event"] = None
+            if slot["fence"] is not None:
+                status = GL.glClientWaitSync(slot["fence"], 0, 0)
+                if status == GL.GL_WAIT_FAILED:
+                    raise RuntimeError("OpenGL upload fence failed")
+                if status in (GL.GL_ALREADY_SIGNALED, GL.GL_CONDITION_SATISFIED):
+                    GL.glDeleteSync(slot["fence"])
+                    slot["fence"] = None
+        free = next((slot for slot in self._slots
+                     if slot["event"] is None and slot["fence"] is None), None)
+        if self._pending_image is not None and free is not None:
+            image, ready, aspect = self._pending_image
+            # Keep the latest queued image alive until its producer completes.
+            if ready.done:
+                slot = free
+                with image.device, self._upload_stream:
+                    if slot["shape"] != image.shape:
+                        if slot["resource"] is not None:
+                            _cuda_result(self.cuda.cudaGraphicsUnregisterResource(slot["resource"]))
+                            slot["resource"] = None
+                        if not slot["pbo"]:
+                            slot["pbo"] = GL.glGenBuffers(1)
+                        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, slot["pbo"])
+                        GL.glBufferData(GL.GL_PIXEL_UNPACK_BUFFER, image.nbytes, None, GL.GL_STREAM_DRAW)
+                        GL.glBindBuffer(GL.GL_PIXEL_UNPACK_BUFFER, 0)
+                        slot["resource"], = _cuda_result(self.cuda.cudaGraphicsGLRegisterBuffer(
+                            int(slot["pbo"]), self.cuda.cudaGraphicsRegisterFlags.cudaGraphicsRegisterFlagsWriteDiscard))
+                        slot["shape"] = image.shape
+                    stream = self._upload_stream
+                    slot["source"], slot["aspect"] = image, aspect
+                    _cuda_result(self.cuda.cudaGraphicsMapResources(1, slot["resource"], stream.ptr))
+                    try:
+                        ptr, size = _cuda_result(self.cuda.cudaGraphicsResourceGetMappedPointer(slot["resource"]))
+                        if size < image.nbytes:
+                            raise RuntimeError("Mapped buffer is smaller than the image")
+                        cp.cuda.runtime.memcpyAsync(int(ptr), image.data.ptr, image.nbytes,
+                                                   cp.cuda.runtime.memcpyDeviceToDevice, stream.ptr)
+                    finally:
+                        _cuda_result(self.cuda.cudaGraphicsUnmapResources(1, slot["resource"], stream.ptr))
+                        slot["event"] = cp.cuda.Event(disable_timing=True)
+                        slot["event"].record(stream)
+                self._pending_image = None
+                self._slots = [item for item in self._slots if item is not slot]
+                self._slots.append(slot)
+        if not self._retired_sources and self._pending_image is None and all(slot["event"] is None and slot["fence"] is None
+                                              for slot in self._slots):
+            self._poll_timer.stop()
 
     def paintGL(self):  # noqa: N802
         if self._error is not None:
             return
         GL = self.gl
+        try:
+            self._pump_uploads()
+        except Exception as exc:
+            self._error = exc
+            self._poll_timer.stop()
+            if hasattr(self.window(), "statusBar"):
+                self.window().statusBar().showMessage(f"Display failed: {exc}")
+            return
         GL.glClearColor(0.06, 0.06, 0.06, 1.0)
         GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         if self._shape is None:
@@ -344,6 +416,7 @@ class CudaImageView(QOpenGLWidget):
         GL.glUseProgram(0)
 
     def cleanup(self):
+        self._poll_timer.stop()
         self.makeCurrent()
         try:
             self._release_image()

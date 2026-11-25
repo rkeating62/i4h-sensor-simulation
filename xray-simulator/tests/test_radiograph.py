@@ -4,6 +4,7 @@ Set XRAY_TEST_CUDA_GL=1 on an NVIDIA desktop to include the Qt interop test.
 """
 
 import os
+import time
 import numpy as np
 import pytest
 
@@ -108,8 +109,15 @@ def test_qt_interop_upload_resize_and_cleanup(cupy):
             with cupy.cuda.Stream(non_blocking=True):
                 for view in views:
                     view.set_image(cupy.asarray(host))
-            app.processEvents()
+            deadline = time.monotonic() + 10
+            while any(view._poll_timer.isActive() for view in views) and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.001)
             for view in views:
+                assert view._error is None
+                assert not view._poll_timer.isActive()
+                assert len(view._slots) == 2
+                assert all(slot["source"] is None for slot in view._slots)
                 view.makeCurrent()
                 try:
                     gl = view.gl
@@ -124,8 +132,8 @@ def test_qt_interop_upload_resize_and_cleanup(cupy):
                     view.doneCurrent()
         for view in views:
             view.cleanup()
-            assert view._resource is None
-            assert view._texture == view._pbo == view._program == view._vao == 0
+            assert view._slots == []
+            assert view._texture == view._program == view._vao == 0
             view.cleanup()  # Qt may also deliver aboutToBeDestroyed after close.
     finally:
         for view in views:
