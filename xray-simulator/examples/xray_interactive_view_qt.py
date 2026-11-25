@@ -508,6 +508,8 @@ class XraySimulatorWindow(QMainWindow):
         self.realism_enabled = False
         self.simulator: xray_simulator | None = None
         self.current_rotation = self.current_translation = None
+        self._sensor_image = None
+        self._current_realism = None
         self._needs_simulator_reset = True
 
         self.render_timer = QTimer(self)
@@ -605,7 +607,6 @@ class XraySimulatorWindow(QMainWindow):
             "blur": SliderRow("Gaussian Blur [px]", 0, 100, 0, scale=10.0),
         }
         for slider in self.realism_sliders.values():
-            slider.slider.valueChanged.connect(self.on_realism_slider_changed)
             realism_sliders_layout.addWidget(slider)
         self.realism_sliders_group.setEnabled(False)
         realism_layout.addWidget(self.realism_sliders_group)
@@ -659,23 +660,21 @@ class XraySimulatorWindow(QMainWindow):
         if sdd != self.geometry_sliders["sdd"].value():
             self.geometry_sliders["sdd"].set_value(sdd)
 
-        new_simulator_required = (
-            self.simulator is None
-            or self._needs_simulator_reset
-            or self.simulator.config.geometry != self.geometry_controls()
-            or self.simulator.config.realism != self.realism_controls()
-        )
-        if not new_simulator_required:
-            return False
-
-        config = SimulatorConfig(
-            geometry=self.geometry_controls(),
-            physics=DEFAULT_PHYSICS,
-            realism=self.realism_controls(),
-        ).with_output(keep_intensity=True)
-        self.simulator = xray_simulator(self.volume, config)
-        self._needs_simulator_reset = False
-        return True
+        geometry = self.geometry_controls()
+        if self.simulator is None or self._needs_simulator_reset:
+            config = SimulatorConfig(
+                geometry=geometry,
+                physics=DEFAULT_PHYSICS,
+                realism=RealismSettings(enabled=False),
+            ).with_output(keep_intensity=True)
+            self.simulator = xray_simulator(self.volume, config)
+            self._sensor_image = None
+            self._needs_simulator_reset = False
+            return True
+        if self.simulator.config.geometry != geometry:
+            self.simulator.update_geometry(geometry)
+            return True
+        return False
 
     def rotation_controls(self) -> tuple[float, float, float]:
         return (
@@ -695,7 +694,9 @@ class XraySimulatorWindow(QMainWindow):
         try:
             simulator_changed = self._rebuild_simulator_if_needed()
             assert self.simulator is not None
+            realism = self.realism_controls()
             do_render = ( simulator_changed
+                         or self._sensor_image is None
                          or self.current_rotation != self.rotation_controls()
                          or self.current_translation != self.translation_controls()
             )
@@ -713,8 +714,9 @@ class XraySimulatorWindow(QMainWindow):
                 )
                 if not batch.is_cuda:
                     raise RuntimeError("The viewer requires the CUDA rendering backend")
-                sensor = cp.from_dlpack(batch[0])
-                sensor = self._apply_gpu_realism(sensor)
+                self._sensor_image = cp.from_dlpack(batch[0])
+            if do_render or realism != self._current_realism:
+                sensor = self._apply_gpu_realism(self._sensor_image, realism)
                 radiograph = process_radiograph(
                     sensor,
                     i0=self.simulator.config.physics.i0,
@@ -726,6 +728,7 @@ class XraySimulatorWindow(QMainWindow):
                 )
                 self.raw_image_view.set_image(self._format_raw_for_display(sensor))
                 self.image_view.set_image(radiograph.display)
+                self._current_realism = realism
                 self._set_status(
                     f"Rendered {sensor.shape[1]}x{sensor.shape[0]} frame from "
                     f"{self.volume.metadata.source or 'synthetic volume'}."
@@ -735,12 +738,11 @@ class XraySimulatorWindow(QMainWindow):
             self._set_status(f"Render failed: {exc}")
             QMessageBox.critical(self, "Render Error", str(exc))
 
-    def _apply_gpu_realism(self, image):
+    def _apply_gpu_realism(self, image, cfg):
         """Apply the viewer's detector noise and blur controls on the GPU."""
         import cupy as cp
         from cupyx.scipy.ndimage import gaussian_filter
 
-        cfg = self.simulator.config.realism
         if not cfg.enabled:
             return image
         out = cp.maximum(image * cfg.gain + cfg.bias, 0)
@@ -784,10 +786,6 @@ class XraySimulatorWindow(QMainWindow):
     def toggle_realism(self, checked: bool) -> None:
         self.realism_enabled = checked
         self.realism_sliders_group.setEnabled(checked)
-        self._needs_simulator_reset = True
-
-    def on_realism_slider_changed(self, _value: int) -> None:
-        self._needs_simulator_reset = True
 
     def load_ct_volume(self) -> None:
         path_str, _selected_filter = QFileDialog.getOpenFileName(

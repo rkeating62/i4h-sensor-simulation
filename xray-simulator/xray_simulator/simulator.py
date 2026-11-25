@@ -413,6 +413,11 @@ class xray_simulator:
                 "Make sure slangpy is installed: pip install slangpy"
             ) from e
 
+    def update_geometry(self, geometry) -> None:
+        """Change acquisition geometry between renders, retaining the uploaded CT."""
+        self._renderer.update_geometry(geometry)
+        self._config = replace(self._config, geometry=geometry)
+
     def render_frame(
         self,
         rotation: tuple[float, float, float] = (0.0, 0.0, 0.0),

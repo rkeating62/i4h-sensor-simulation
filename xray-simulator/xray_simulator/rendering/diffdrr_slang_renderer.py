@@ -80,7 +80,7 @@ Requirements:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Union
 
@@ -354,6 +354,11 @@ class SlangDiffDRRRenderer:
         })
         self._sampler = self._device.create_sampler(sampler_desc)
 
+        self._create_detector_resources()
+
+    def _create_detector_resources(self):
+        """Allocate detector-sized textures without uploading the volume again."""
+        cfg = self._cfg
         # Output image texture (2D)
         self._output_texture = self._device.create_texture(
             type=slangpy.TextureType.texture_2d,
@@ -391,6 +396,29 @@ class SlangDiffDRRRenderer:
             usage=slangpy.TextureUsage.shader_resource | slangpy.TextureUsage.unordered_access,
         )
         print(f"  Gradient textures: {cfg.det_width_px}x{cfg.det_height_px}")
+
+    def update_geometry(self, geometry):
+        """Update acquisition geometry while retaining the device and CT texture.
+
+        Call between renders. Detector dimensions invalidate only detector-sized
+        textures and the batch buffer cache.
+        """
+        cfg = replace(
+            self._cfg,
+            det_width_px=geometry.detector_width_px,
+            det_height_px=geometry.detector_height_px,
+            pixel_spacing_mm=geometry.pixel_spacing_mm,
+            pixel_spacing_y_mm=geometry.pixel_spacing_y_mm,
+            detector_offset_xy_mm=geometry.detector_offset_xy_mm,
+            source_to_detector_mm=geometry.source_to_detector_mm,
+            source_to_isocenter_mm=geometry.source_to_isocenter_mm,
+        )
+        resized = (cfg.det_width_px, cfg.det_height_px) != (
+            self._cfg.det_width_px, self._cfg.det_height_px)
+        self._cfg = cfg
+        if resized:
+            self._batch_cache = None
+            self._create_detector_resources()
 
     def _build_params(
         self,
