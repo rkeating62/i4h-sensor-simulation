@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import ctypes
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import sys
 from pathlib import Path
@@ -260,7 +260,7 @@ class CudaImageView(QOpenGLWidget):
             self._texture = 0
         self._shape = None
 
-    def set_image(self, image):
+    def set_image(self, image, *, display_aspect=None):
         """Upload device pixels while this widget's OpenGL context is current."""
         if not self.isValid():
             raise RuntimeError("A working NVIDIA OpenGL context is required")
@@ -312,6 +312,7 @@ class CudaImageView(QOpenGLWidget):
                 GL.glTexSubImage2D(GL.GL_TEXTURE_2D, 0, 0, 0, width, height,
                                    GL.GL_RED, GL.GL_UNSIGNED_SHORT, ctypes.c_void_p(0))
                 self._image = image
+                self._display_aspect = display_aspect or (width / height)
         finally:
             if hasattr(self, "gl"):
                 self.gl.glBindBuffer(self.gl.GL_PIXEL_UNPACK_BUFFER, 0)
@@ -329,8 +330,9 @@ class CudaImageView(QOpenGLWidget):
         rows, cols = self._shape
         ratio = self.devicePixelRatioF()
         width, height = round(self.width() * ratio), round(self.height() * ratio)
-        scale = min(width / cols, height / rows)
-        vw, vh = round(cols * scale), round(rows * scale)
+        aspect = self._display_aspect
+        vw = min(width, round(height * aspect))
+        vh = min(height, round(width / aspect))
         GL.glViewport((width - vw) // 2, (height - vh) // 2, vw, vh)
         GL.glUseProgram(self._program)
         GL.glActiveTexture(GL.GL_TEXTURE0)
@@ -498,6 +500,18 @@ class FloatInputRow(QWidget):
         self.input.setText(self._format_value(self._value))
 
 
+def preview_geometry(geometry: CarmGeometry) -> CarmGeometry:
+    """Use 768 rows x 1024 columns over the same physical detector area."""
+    dy = geometry.pixel_spacing_y_mm
+    if dy is None:
+        dy = geometry.pixel_spacing_mm
+    return replace(
+        geometry, detector_width_px=1024, detector_height_px=768,
+        pixel_spacing_mm=geometry.pixel_spacing_mm * geometry.detector_width_px / 1024,
+        pixel_spacing_y_mm=dy * geometry.detector_height_px / 768,
+    )
+
+
 @dataclass(frozen=True)
 class RenderState:
     volume: PreprocessedVolume
@@ -505,11 +519,13 @@ class RenderState:
     realism: RealismSettings
     rotation: tuple
     translation: tuple
+    preview: bool = False
 
     def matches(self, other):
         return (self.volume is other.volume and self.geometry == other.geometry
                 and self.realism == other.realism and self.rotation == other.rotation
-                and self.translation == other.translation)
+                and self.translation == other.translation
+                and self.preview == other.preview)
 
 
 class RenderWorker(threading.Thread):
@@ -648,6 +664,12 @@ class XraySimulatorWindow(QMainWindow):
         self.render_timer.timeout.connect(self.render_current_view)
 
         self._build_ui()
+        self._drag_sliders = [row.slider for group in (
+            self.geometry_sliders, self.pose_sliders, self.realism_sliders
+        ) for row in group.values()]
+        for slider in self._drag_sliders:
+            slider.sliderPressed.connect(self.render_current_view)
+            slider.sliderReleased.connect(self.render_current_view)
         self._set_status("Loaded synthetic demo volume.")
         self.render_timer.start(33)  # Start rendering at 30 fps immediately after UI is shown
 
@@ -803,8 +825,12 @@ class XraySimulatorWindow(QMainWindow):
         sid = self.geometry_sliders["sid"].value()
         if self.geometry_sliders["sdd"].value() <= sid:
             self.geometry_sliders["sdd"].set_value(sid + 1)
-        state = RenderState(self.volume, self.geometry_controls(), self.realism_controls(),
-                            self.rotation_controls(), self.translation_controls())
+        preview = any(slider.isSliderDown() for slider in self._drag_sliders)
+        geometry = self.geometry_controls()
+        if preview:
+            geometry = preview_geometry(geometry)
+        state = RenderState(self.volume, geometry, self.realism_controls(),
+                            self.rotation_controls(), self.translation_controls(), preview)
         if self._last_state is None or not state.matches(self._last_state):
             self._generation += 1
             self._last_state = state
@@ -823,10 +849,15 @@ class XraySimulatorWindow(QMainWindow):
         if state.volume is not self.volume:
             return
         try:
-            self.raw_image_view.set_image(raw)
-            self.image_view.set_image(display)
+            geometry = state.geometry
+            dy = geometry.pixel_spacing_y_mm or geometry.pixel_spacing_mm
+            aspect = (geometry.detector_width_px * geometry.pixel_spacing_mm
+                      / (geometry.detector_height_px * dy))
+            self.raw_image_view.set_image(raw, display_aspect=aspect)
+            self.image_view.set_image(display, display_aspect=aspect)
             self._set_status(
-                f"Rendered {display.shape[1]}x{display.shape[0]} frame from "
+                f"{'Preview' if state.preview else 'Rendered'} "
+                f"{display.shape[1]}x{display.shape[0]} frame from "
                 f"{state.volume.metadata.source or 'synthetic volume'}."
             )
         except Exception as exc:

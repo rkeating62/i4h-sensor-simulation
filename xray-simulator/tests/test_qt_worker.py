@@ -53,3 +53,21 @@ def test_worker_keeps_only_latest_pending_state():
         worker.stop()
         worker.join(10)
     assert not worker.is_alive()
+
+
+@pytest.mark.parametrize('width,height,dx,dy', [(3072, 3072, .15, None), (1500, 900, .2, .3)])
+def test_preview_preserves_detector_field_of_view(width, height, dx, dy):
+    pytest.importorskip('PySide6')
+    from examples.xray_interactive_view_qt import preview_geometry
+    from xray_simulator import CarmGeometry
+
+    original = CarmGeometry(detector_width_px=width, detector_height_px=height,
+                            pixel_spacing_mm=dx, pixel_spacing_y_mm=dy,
+                            detector_offset_xy_mm=(12., -8.))
+    preview = preview_geometry(original)
+    assert (preview.detector_height_px, preview.detector_width_px) == (768, 1024)
+    assert preview.detector_width_px * preview.pixel_spacing_mm == pytest.approx(width * dx)
+    assert preview.detector_height_px * preview.pixel_spacing_y_mm == pytest.approx(height * (dy or dx))
+    assert preview.detector_offset_xy_mm == original.detector_offset_xy_mm
+    assert preview.source_to_detector_mm == original.source_to_detector_mm
+    assert preview.source_to_isocenter_mm == original.source_to_isocenter_mm
