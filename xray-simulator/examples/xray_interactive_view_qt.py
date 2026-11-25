@@ -384,9 +384,13 @@ class CudaImageView(QOpenGLWidget):
             self._poll_timer.stop()
 
     def paintGL(self):  # noqa: N802
-        if self._error is not None:
+        if not hasattr(self, "gl"):
             return
         GL = self.gl
+        GL.glClearColor(0.06, 0.06, 0.06, 1.0)
+        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
+        if self._error is not None:
+            return
         try:
             self._pump_uploads()
         except Exception as exc:
@@ -395,8 +399,6 @@ class CudaImageView(QOpenGLWidget):
             if hasattr(self.window(), "statusBar"):
                 self.window().statusBar().showMessage(f"Display failed: {exc}")
             return
-        GL.glClearColor(0.06, 0.06, 0.06, 1.0)
-        GL.glClear(GL.GL_COLOR_BUFFER_BIT)
         if self._shape is None:
             return
         rows, cols = self._shape
@@ -732,6 +734,11 @@ class XraySimulatorWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        # Let Qt compose valid initial GL frames before the compositor reveals
+        # the native window. This avoids displaying stale desktop pixels on X11.
+        self.setWindowOpacity(0.0)
+        self._startup_painted_views = set()
+        self.setAutoFillBackground(True)
         self.setWindowTitle(f"X-Ray Simulation Viewer ({QT_API})")
         self.resize(1800, 950)
 
@@ -752,6 +759,7 @@ class XraySimulatorWindow(QMainWindow):
         for control in self._startup_controls:
             control.setEnabled(False)
         for view in (self.raw_image_view, self.image_view):
+            view.frameSwapped.connect(lambda view=view: self._reveal_after_first_paint(view))
             view.frameSwapped.connect(lambda view=view: self._initial_frame_presented(view))
         self._drag_sliders = [row.slider for group in (
             self.geometry_sliders, self.pose_sliders, self.realism_sliders
@@ -863,6 +871,14 @@ class XraySimulatorWindow(QMainWindow):
         self._startup_controls = (
             self.load_button, geometry_group, pose_group, realism_group, self.reset_button,
         )
+
+    def _reveal_after_first_paint(self, view) -> None:
+        """Reveal the GUI after both GL backgrounds have reached composition."""
+        if self.windowOpacity() >= 1.0:
+            return
+        self._startup_painted_views.add(view)
+        if len(self._startup_painted_views) == 2:
+            QTimer.singleShot(0, lambda: self.setWindowOpacity(1.0))
 
     def _initial_frame_presented(self, view) -> None:
         """Unlock controls after both image widgets have presented real pixels."""
